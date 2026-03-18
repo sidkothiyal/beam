@@ -1,0 +1,125 @@
+# Beam configuration for the elemental project
+# Place this file as beam.yaml in the elemental project root.
+#
+# Usage:
+#   beam run --provider vast.ai --pulse 5m --pulse-idle-stop -- \
+#     "uv run python src/data_processor/download.py --download_dir=./data --dataset_name=div2k && \
+#      uv run python src/trainer.py experiment/autoencoder/compression_ae.yaml"
+
+project:
+  name: elemental
+  docker_image: elemental
+  dep_files: [pyproject.toml, uv.lock]
+
+registry:
+  ghcr_image_name: loom-env
+  ghcr_tag: latest
+  # Requires GITHUB_USERNAME and DOCKER_GHRC_TOKEN (or GITHUB_TOKEN) in env
+
+remote:
+  project_dir: /workspace
+  home: /root
+  user: root
+
+ssh:
+  connect_timeout: 20
+  retry_attempts: 5
+  retry_interval: 10
+
+credentials:
+  kaggle: ~/.kaggle/kaggle.json
+  env_vars:
+    - WANDB_API_KEY
+    - HUGGING_FACE_HUB_TOKEN
+
+providers:
+  runpod:
+    configs:
+      - name: a40
+        gpu_type: "NVIDIA A40"
+        gpu_count: 1
+        cloud_tier: secure
+        spot: true
+        recovery_policy: new
+        image: "runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404"
+        container_disk_size: 30
+        volume_size: 50
+        volume_path: /workspace
+        network_volume_id: ghkc70e22v
+        min_memory_gb: 20
+        ports: ["22/tcp"]
+        ssh_public_key_files:
+          - ~/.ssh/id_ed25519.pub
+          - ~/.ssh/id_ed25519_sid.pub
+
+      - name: l40s
+        gpu_type: "NVIDIA L40S"
+        gpu_count: 1
+        cloud_tier: secure
+        spot: true
+        recovery_policy: new
+        image: "runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404"
+        container_disk_size: 30
+        volume_size: 50
+        volume_path: /workspace
+        network_volume_id: gdfzdf07b5
+        min_memory_gb: 20
+        ports: ["22/tcp"]
+        ssh_public_key_files:
+          - ~/.ssh/id_ed25519.pub
+          - ~/.ssh/id_ed25519_sid.pub
+
+    fallback_order: [a40, l40s]
+
+  vastai:
+    configs:
+      - name: a100_pcie
+        instance_label: elemental-training
+        gpu_name: "A100 PCIE"
+        num_gpus: 1
+        machine_id: 56759
+        offer_type: bid
+        offer_limit: 10
+        price: 0.160
+        price_max: 0.200
+        price_step: 0.005
+        disk_gb: 50
+        recovery_policy: new
+        onstart: "chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys && chown root:root /root/.ssh /root/.ssh/authorized_keys"
+
+      - name: a100_sxm4
+        instance_label: elemental-training
+        gpu_name: "A100 SXM4"
+        num_gpus: 1
+        machine_id: 49290
+        offer_type: bid
+        offer_limit: 10
+        price: 0.155
+        price_max: 0.200
+        price_step: 0.005
+        disk_gb: 50
+        recovery_policy: new
+        onstart: "chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys && chown root:root /root/.ssh /root/.ssh/authorized_keys"
+
+      - name: rtx_pro_6000
+        instance_label: elemental-training
+        gpu_name: "RTX PRO 4500"
+        num_gpus: 1
+        machine_id: 56182
+        offer_type: bid
+        offer_limit: 10
+        price: 0.125
+        price_max: 0.200
+        price_step: 0.005
+        disk_gb: 50
+        recovery_policy: new
+        onstart: "chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys && chown root:root /root/.ssh /root/.ssh/authorized_keys"
+
+    fallback_order: [a100_pcie]
+
+pulse:
+  gpu_idle_threshold: 5
+  gpu_idle_max_strikes: 3
+  gpu_idle_samples: 5
+  gpu_idle_sample_interval: 2
+  max_retries: 5
