@@ -266,6 +266,11 @@ def check_job_state(sess: dict[str, Any], cfg: BeamConfig | None = None) -> dict
     port = sess.get("port", "22")
     state_dir = sess.get("remote_state_dir", "")
     tmux_name = sess.get("tmux_session", "") or sess.get("session_id", "")
+    # Reconstruct state_dir from session metadata if it was not saved (legacy sessions)
+    if not state_dir and tmux_name:
+        remote_logs_dir = sess.get("remote_logs_dir", "")
+        if remote_logs_dir:
+            state_dir = f"{remote_logs_dir}/.beam_state/{tmux_name}"
     if not ip or not state_dir:
         return {"state": "unknown"}
 
@@ -701,7 +706,7 @@ def run_check(
 
     # Determine job state (only if instance is up and we have state dir info)
     job_info: dict[str, Any] = {"state": "unknown"}
-    if instance_status in ("running", "reachable") and sess.get("remote_state_dir"):
+    if instance_status in ("running", "reachable") and sess.get("ip"):
         job_info = check_job_state(sess, cfg)
 
     job_state = job_info.get("state", "unknown")
