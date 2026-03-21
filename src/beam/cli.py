@@ -12,7 +12,13 @@ import typer
 from rich.table import Table
 
 from beam import log
-from beam.config import BeamConfig, load_config, get_project_root
+from beam.config import (
+    BeamConfig,
+    RunPodMachineConfig,
+    VastAIMachineConfig,
+    load_config,
+    get_project_root,
+)
 
 app = typer.Typer(
     name="beam",
@@ -38,10 +44,12 @@ def run(
     provider: Optional[str] = typer.Option(None, "--provider", help="Cloud provider: runpod, vast.ai"),
     pod_id: Optional[str] = typer.Option(None, "--pod-id", help="Existing pod/instance ID"),
     pod_config: Optional[str] = typer.Option(None, "--pod-config", help="Named machine config from beam.yaml"),
+    name: Optional[str] = typer.Option(None, "--name", "-n", help="Custom session name for easier tracking"),
     remote_project_dir: Optional[str] = typer.Option(None, "--remote-project-dir", help="Remote workspace root"),
     remote_home: Optional[str] = typer.Option(None, "--remote-home", help="Remote home directory"),
     pulse_interval: Optional[str] = typer.Option(None, "--pulse", help="Pulse cron interval (e.g. 5m, 1h)"),
     pulse_idle_stop: bool = typer.Option(False, "--pulse-idle-stop", help="Stop when GPU idle"),
+    no_auto_stop_on_complete: bool = typer.Option(False, "--no-auto-stop-on-complete", help="Don't auto-stop when job finishes"),
     config_file: Optional[str] = typer.Option(None, "--config", help="Path to beam.yaml"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
     quiet: bool = typer.Option(False, "--quiet", "-q", help="Quiet output"),
@@ -76,6 +84,7 @@ def run(
         provider=provider or "",
         pod_id=pod_id or "",
         pod_config_name=pod_config or "",
+        name=name or "",
         ip=ip or "",
         port=port or "",
         command=cmd_str,
@@ -100,6 +109,7 @@ def run(
                 interval_secs,
                 auto_restart=True,
                 idle_stop=pulse_idle_stop,
+                auto_stop_on_complete=not no_auto_stop_on_complete,
                 max_retries=cfg.pulse.max_retries,
                 logs_dir=ctx.logs_dir,
             )
@@ -111,10 +121,12 @@ def run(
 
 @app.command()
 def status(
+    live: bool = typer.Option(False, "--live", help="SSH into remotes to check job state (slower)"),
     config_file: Optional[str] = typer.Option(None, "--config", help="Path to beam.yaml"),
 ) -> None:
     """Show all active sessions."""
     cfg_path = Path(config_file) if config_file else None
+    cfg = load_config(config_path=cfg_path) if live else None
     repo_root = get_project_root(cfg_path)
     logs_dir = repo_root / ".beam" / "logs"
 
@@ -130,6 +142,8 @@ def status(
     table.add_column("Provider")
     table.add_column("Pod/Instance")
     table.add_column("Host")
+    table.add_column("Job State")
+    table.add_column("Est. Cost")
     table.add_column("Cron", style="green")
 
     for s in sessions:
@@ -137,11 +151,24 @@ def status(
         p = s.get("port", "")
         if p and p != "22":
             host = f"{host}:{p}"
+
+        job_state = "?"
+        if live:
+            try:
+                info = pulse_mod.check_job_state(s, cfg)
+                job_state = info.get("state", "?")
+            except Exception:
+                job_state = "error"
+
+        cost = pulse_mod.compute_session_cost(logs_dir, s.get("session_id", ""), s)
+
         table.add_row(
             s.get("session_id", "?"),
             s.get("provider", "ssh"),
             s.get("pod_id", "-"),
             host or "-",
+            job_state,
+            cost,
             "active" if s.get("cron_active") else "inactive",
         )
 
@@ -212,6 +239,7 @@ providers:
       - name: default
         gpu_name: "A100 PCIE"
         num_gpus: 1
+        num_gpus_max: 1
         offer_type: bid
         price: 0.16
         price_max: 0.20
@@ -231,6 +259,223 @@ pulse:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# beam offers
+# ═══════════════════════════════════════════════════════════════════════════
+
+@app.command()
+def offers(
+    provider: str = typer.Option(..., "--provider", help="Cloud provider: runpod, vast.ai"),
+    pod_config: Optional[str] = typer.Option(None, "--pod-config", help="Named machine config from beam.yaml"),
+    config_file: Optional[str] = typer.Option(None, "--config", help="Path to beam.yaml"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
+    quiet: bool = typer.Option(False, "--quiet", "-q", help="Quiet output"),
+) -> None:
+    """List compatible GPU instances available for the given config."""
+    log.set_verbosity(verbose=verbose, quiet=quiet)
+
+    cfg_path = Path(config_file) if config_file else None
+    cfg = load_config(config_path=cfg_path)
+
+    if provider in ("vast.ai", "vastai"):
+        _list_vastai_offers(cfg, pod_config)
+    elif provider == "runpod":
+        _list_runpod_offers(cfg, pod_config)
+    else:
+        log.error(f"Unknown provider: {provider} (supported: runpod, vast.ai)")
+        raise typer.Exit(1)
+
+
+def _resolve_vastai_machine_config(
+    cfg: BeamConfig, pod_config_name: str | None
+) -> VastAIMachineConfig:
+    prov_cfg = cfg.providers.vastai
+    if pod_config_name:
+        for mc in prov_cfg.configs:
+            if mc.name == pod_config_name:
+                return mc
+        log.error(f"Vast.ai config '{pod_config_name}' not found in beam.yaml")
+        raise typer.Exit(1)
+    if prov_cfg.fallback_order:
+        name = prov_cfg.fallback_order[0]
+        for mc in prov_cfg.configs:
+            if mc.name == name:
+                return mc
+    if prov_cfg.configs:
+        return prov_cfg.configs[0]
+    log.error("No Vast.ai machine configs found in beam.yaml")
+    raise typer.Exit(1)
+
+
+def _resolve_runpod_machine_config(
+    cfg: BeamConfig, pod_config_name: str | None
+) -> RunPodMachineConfig:
+    prov_cfg = cfg.providers.runpod
+    if pod_config_name:
+        for mc in prov_cfg.configs:
+            if mc.name == pod_config_name:
+                return mc
+        log.error(f"RunPod config '{pod_config_name}' not found in beam.yaml")
+        raise typer.Exit(1)
+    if prov_cfg.fallback_order:
+        name = prov_cfg.fallback_order[0]
+        for mc in prov_cfg.configs:
+            if mc.name == name:
+                return mc
+    if prov_cfg.configs:
+        return prov_cfg.configs[0]
+    log.error("No RunPod machine configs found in beam.yaml")
+    raise typer.Exit(1)
+
+
+def _list_vastai_offers(cfg: BeamConfig, pod_config_name: str | None) -> None:
+    from beam.providers.vastai import VastAIProvider
+
+    mc = _resolve_vastai_machine_config(cfg, pod_config_name)
+
+    reqs = []
+    if mc.gpu_name:
+        reqs.append(f"gpu={mc.gpu_name}")
+    if mc.gpu_ram_min is not None:
+        reqs.append(f"vram>={mc.gpu_ram_min}GB")
+    if mc.num_gpus_max is not None:
+        reqs.append(f"gpus={mc.num_gpus}..{mc.num_gpus_max}")
+    else:
+        reqs.append(f"gpus>={mc.num_gpus}")
+    if mc.dlperf_min is not None:
+        reqs.append(f"dlperf>={mc.dlperf_min}")
+    if mc.price_max is not None:
+        reqs.append(f"max=${mc.price_max:.4f}/hr")
+
+    log.step(
+        f"Searching Vast.ai offers for config '{mc.name}' "
+        f"({', '.join(reqs)}) [pick={mc.pick_strategy}, bid={mc.bid_strategy}] ..."
+    )
+
+    provider = VastAIProvider()
+    offers_list = provider.list_compatible_offers(mc)
+
+    if not offers_list:
+        log.warn("No compatible offers found.")
+        return
+
+    is_bid = mc.offer_type == "bid"
+
+    table = Table(title=f"Vast.ai Compatible Offers — config '{mc.name}'")
+    table.add_column("#", style="dim", justify="right")
+    table.add_column("Offer ID", style="cyan")
+    table.add_column("GPU")
+    table.add_column("Count", justify="right")
+    table.add_column("VRAM", justify="right")
+    if is_bid:
+        table.add_column("Min Bid", justify="right", style="yellow")
+        table.add_column("Your Bid", justify="right", style="green")
+    table.add_column("Total $/hr", justify="right", style="yellow")
+    table.add_column("Base $/hr", justify="right", style="dim")
+    table.add_column("Adj $/hr", justify="right")
+    table.add_column("Search $/hr", justify="right")
+    table.add_column("DLPerf", justify="right")
+    table.add_column("Reliability", justify="right")
+    table.add_column("Machine", justify="right", style="dim")
+
+    for i, o in enumerate(offers_list, 1):
+        gpu_name = o.get("gpu_name", "?")
+        num_gpus = str(o.get("num_gpus", "?"))
+        gpu_ram_mb = o.get("gpu_ram", 0)
+        vram = f"{gpu_ram_mb / 1024:.0f}GB" if gpu_ram_mb else "?"
+        dlperf = o.get("dlperf", 0)
+        dlperf_str = f"{dlperf:.1f}" if dlperf else "-"
+        reliability = o.get("reliability", 0)
+        rel_str = f"{reliability:.2f}" if reliability else "-"
+        machine_id = str(o.get("machine_id", "-"))
+        offer_id = str(o.get("id", "?"))
+
+        dph_base = o.get("dph_base", 0.0)
+        dph_base_str = f"${dph_base:.4f}" if dph_base else "-"
+        dph_adj = o.get("dph_total_adj", 0.0)
+        dph_adj_str = f"${dph_adj:.4f}" if dph_adj else "-"
+        search_total = (o.get("search") or {}).get("totalHour", 0.0)
+        search_str = f"${search_total:.4f}" if search_total else "-"
+
+        dph = o.get("dph_total", 0.0)
+        dph_str = f"${dph:.4f}" if dph else "-"
+
+        if is_bid:
+            min_bid = o.get("min_bid", 0.0)
+            computed_bid = o.get("_computed_bid", 0.0)
+            table.add_row(
+                str(i), offer_id, gpu_name, num_gpus, vram,
+                f"${min_bid:.4f}", f"${computed_bid:.4f}",
+                dph_str, dph_base_str, dph_adj_str, search_str,
+                dlperf_str, rel_str, machine_id,
+            )
+        else:
+            table.add_row(
+                str(i), offer_id, gpu_name, num_gpus, vram,
+                dph_str, dph_base_str, dph_adj_str, search_str,
+                dlperf_str, rel_str, machine_id,
+            )
+
+    log.console.print(table)
+    log.done(f"{len(offers_list)} compatible offer(s) found.")
+
+
+def _list_runpod_offers(cfg: BeamConfig, pod_config_name: str | None) -> None:
+    from beam.providers.runpod import RunPodProvider
+
+    mc = _resolve_runpod_machine_config(cfg, pod_config_name)
+
+    reqs = []
+    if mc.gpu_type:
+        reqs.append(f"gpu={mc.gpu_type}")
+    if mc.max_cost is not None:
+        reqs.append(f"max=${mc.max_cost:.2f}/hr")
+    reqs.append(f"tier={mc.cloud_tier}")
+    if mc.spot:
+        reqs.append("spot=yes")
+
+    log.step(
+        f"Listing RunPod GPU types for config '{mc.name}' "
+        f"({', '.join(reqs)}) ..."
+    )
+
+    provider = RunPodProvider()
+    gpu_types = provider.list_gpu_types(mc)
+
+    if not gpu_types:
+        log.warn("No compatible GPU types found.")
+        return
+
+    table = Table(title=f"RunPod Compatible GPU Types — config '{mc.name}'")
+    table.add_column("#", style="dim", justify="right")
+    table.add_column("GPU Type", style="cyan")
+    table.add_column("VRAM", justify="right")
+    table.add_column("Community $/hr", justify="right")
+    table.add_column("Secure $/hr", justify="right")
+    table.add_column("Spot $/hr", justify="right", style="green")
+
+    for i, t in enumerate(gpu_types, 1):
+        name = t.get("displayName") or t.get("id", "?")
+        mem = t.get("memoryInGb")
+        mem_str = f"{mem}GB" if mem is not None else "?"
+
+        def _fmt_price(key: str) -> str:
+            val = t.get(key)
+            return f"${float(val):.4f}" if val is not None else "-"
+
+        table.add_row(
+            str(i),
+            name,
+            mem_str,
+            _fmt_price("communityPrice"),
+            _fmt_price("securePrice"),
+            _fmt_price("communitySpotPrice"),
+        )
+
+    log.console.print(table)
+    log.done(f"{len(gpu_types)} compatible GPU type(s) found.")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # beam attach
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -245,13 +490,15 @@ def attach(
     port = sess.get("port", "22")
     user = sess.get("user", "root")
     identity = sess.get("identity_file", "")
+    tmux_session = sess.get("tmux_session", session_id)
 
     cmd = ["ssh"]
     if port and port != "22":
         cmd += ["-p", port]
     if identity:
         cmd += ["-i", identity]
-    cmd += [f"{user}@{ip}", "-t", f"tmux attach -t {session_id}"]
+    cmd += ["-o", "StrictHostKeyChecking=accept-new"]
+    cmd += [f"{user}@{ip}", "-t", f"tmux attach -t {tmux_session}"]
     os.execvp("ssh", cmd)
 
 
@@ -262,6 +509,7 @@ def attach(
 @app.command()
 def logs(
     session_id: str = typer.Argument(..., help="Session ID"),
+    follow: bool = typer.Option(True, "--follow/--no-follow", "-f", help="Follow log output"),
     config_file: Optional[str] = typer.Option(None, "--config"),
 ) -> None:
     """Tail remote logs for a session."""
@@ -270,19 +518,24 @@ def logs(
     port = sess.get("port", "22")
     user = sess.get("user", "root")
     identity = sess.get("identity_file", "")
-    remote_project_dir = sess.get("remote_project_dir", "/workspace")
+    tmux_session = sess.get("tmux_session", session_id)
+    remote_logs_dir = sess.get("remote_logs_dir", "")
 
-    cfg_path = Path(config_file) if config_file else None
-    cfg = load_config(config_path=cfg_path)
-    repo_name = cfg.project.name or Path.cwd().name
-    remote_logs_dir = f"{remote_project_dir}/logs/{repo_name}"
+    if not remote_logs_dir:
+        remote_project_dir = sess.get("remote_project_dir", "/workspace")
+        cfg_path = Path(config_file) if config_file else None
+        cfg = load_config(config_path=cfg_path)
+        repo_name = cfg.project.name or Path.cwd().name
+        remote_logs_dir = f"{remote_project_dir}/logs/{repo_name}"
 
+    tail_flag = "-f" if follow else "-n 100"
     cmd = ["ssh"]
     if port and port != "22":
         cmd += ["-p", port]
     if identity:
         cmd += ["-i", identity]
-    cmd += [f"{user}@{ip}", f"tail -f {remote_logs_dir}/{session_id}.log"]
+    cmd += ["-o", "StrictHostKeyChecking=accept-new"]
+    cmd += [f"{user}@{ip}", f"tail {tail_flag} {remote_logs_dir}/{tmux_session}.log"]
     os.execvp("ssh", cmd)
 
 
@@ -355,6 +608,7 @@ def pulse_install(
     interval: str = typer.Option("5m", "--interval", help="Check interval (e.g. 5m, 1h)"),
     auto_restart: bool = typer.Option(True, "--auto-restart/--no-auto-restart"),
     idle_stop: bool = typer.Option(False, "--idle-stop"),
+    auto_stop_on_complete: bool = typer.Option(True, "--auto-stop-on-complete/--no-auto-stop-on-complete"),
     max_retries: int = typer.Option(5, "--max-retries"),
     config_file: Optional[str] = typer.Option(None, "--config"),
 ) -> None:
@@ -377,6 +631,7 @@ def pulse_install(
         interval_secs,
         auto_restart=auto_restart,
         idle_stop=idle_stop,
+        auto_stop_on_complete=auto_stop_on_complete,
         max_retries=max_retries,
         logs_dir=logs_dir,
     )
@@ -410,6 +665,7 @@ def pulse_check(
     session_id: Optional[str] = typer.Option(None, "--session", help="Session ID"),
     auto_restart: bool = typer.Option(False, "--auto-restart"),
     idle_stop: bool = typer.Option(False, "--idle-stop"),
+    auto_stop_on_complete: bool = typer.Option(False, "--auto-stop-on-complete"),
     max_retries: int = typer.Option(5, "--max-retries"),
     config_file: Optional[str] = typer.Option(None, "--config"),
 ) -> None:
@@ -424,11 +680,14 @@ def pulse_check(
     # Resolve session_id from file or argument
     sid = session_id or ""
     if session_file:
-        p = Path(session_file)
+        p = Path(session_file).resolve()
         if p.exists():
             import json
             data = json.loads(p.read_text())
             sid = data.get("session_id", p.stem)
+            # Derive logs_dir from session file path (<logs_dir>/sessions/<id>.json)
+            if p.parent.name == "sessions":
+                logs_dir = p.parent.parent
 
     if not sid:
         log.error("Specify --session <id> or --session-file <path>")
@@ -439,6 +698,7 @@ def pulse_check(
         logs_dir,
         auto_restart=auto_restart,
         idle_stop=idle_stop,
+        auto_stop_on_complete=auto_stop_on_complete,
         max_retries=max_retries,
         pulse_cfg=cfg.pulse,
     )

@@ -72,6 +72,8 @@ class VastAIMachineConfig(BaseModel):
     instance_label: str = ""
     gpu_name: str = ""
     num_gpus: int = 1
+    num_gpus_max: int | None = None
+    gpu_ram_min: float | None = None  # minimum per-GPU VRAM in GB
     machine_id: int | None = None
     offer_type: str = "bid"
     offer_limit: int = 10
@@ -85,8 +87,14 @@ class VastAIMachineConfig(BaseModel):
     image: str = ""
     onstart: str = ""
     env: str = ""
+    pick_strategy: str = "best_value"  # how to rank offers: cheapest, best_value, score
+    bid_strategy: str = "multiplier"   # how to price the bid: multiplier, percentile, fixed
+    bid_multiplier: float = 1.1
+    bid_percentile: float = 0.5
     reliability_min: float | None = None
     dph_max: float | None = None
+    dlperf_min: float | None = None
+    dlperf_per_dphtotal_min: float | None = None
 
 
 class RunPodProviderConfig(BaseModel):
@@ -110,6 +118,7 @@ class PulseConfig(BaseModel):
     gpu_idle_samples: int = 5
     gpu_idle_sample_interval: int = 2
     max_retries: int = 5
+    auto_stop_on_complete: bool = True
 
 
 class BeamConfig(BaseModel):

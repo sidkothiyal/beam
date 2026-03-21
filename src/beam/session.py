@@ -35,6 +35,13 @@ def save_session(
     pod_config_name: str = "",
     recovery_policy: str = "restart",
     ghcr_image: str = "",
+    remote_state_dir: str = "",
+    remote_logs_dir: str = "",
+    remote_code_dir: str = "",
+    tmux_session: str = "",
+    repo_root: str = "",
+    name: str = "",
+    machine_config: dict[str, Any] | None = None,
     extra: dict[str, Any] | None = None,
 ) -> Path:
     """Persist session state to a JSON file. Returns the file path."""
@@ -52,6 +59,12 @@ def save_session(
         "pod_config_name": pod_config_name,
         "recovery_policy": recovery_policy,
         "ghcr_image": ghcr_image,
+        "remote_state_dir": remote_state_dir,
+        "remote_logs_dir": remote_logs_dir,
+        "remote_code_dir": remote_code_dir,
+        "tmux_session": tmux_session,
+        "repo_root": repo_root,
+        "name": name,
         "created_at": datetime.now(timezone.utc).isoformat(),
         # Preserve API keys for pulse auto-restart (same as shell version)
         "runpod_api_key": os.environ.get("RUNPOD_API_KEY", ""),
@@ -60,6 +73,10 @@ def save_session(
         "hf_token": os.environ.get("HUGGING_FACE_HUB_TOKEN", ""),
         "github_username": os.environ.get("GITHUB_USERNAME", ""),
     }
+    # Snapshot the machine config used to create the instance so that
+    # pulse auto-restart can recreate without depending on beam.yaml.
+    if machine_config:
+        data["machine_config"] = machine_config
     if extra:
         data.update(extra)
 

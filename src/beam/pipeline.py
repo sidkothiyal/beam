@@ -32,6 +32,7 @@ class RunContext:
         provider: str = "",
         pod_id: str = "",
         pod_config_name: str = "",
+        name: str = "",
         ip: str = "",
         port: str = "",
         command: str = "",
@@ -44,6 +45,7 @@ class RunContext:
         self.provider = provider
         self.pod_id = pod_id
         self.pod_config_name = pod_config_name
+        self.name = name
         self.ip = ip
         self.port = port
         self.command = command
@@ -201,11 +203,15 @@ def run_remote(ctx: RunContext) -> None:
         remote_code_dir=ctx.remote_code_dir,
         remote_logs_dir=ctx.remote_logs_dir,
         remote_home=cfg.remote.home,
+        name=ctx.name,
     )
+    remote_state_dir = ""
     if result:
         ctx.session_name = result.session_name
+        remote_state_dir = result.remote_state_dir
 
-    # Save session state
+    # Save session state (including machine config snapshot for pulse restarts)
+    machine_cfg_dict = _snapshot_machine_config(ctx)
     session.save_session(
         ctx.logs_dir,
         session_id=ctx.session_name or f"setup-{int(__import__('time').time())}",
@@ -221,6 +227,14 @@ def run_remote(ctx: RunContext) -> None:
         pod_config_name=ctx.pod_config_name,
         recovery_policy=_get_recovery_policy(ctx),
         ghcr_image=ctx.ghcr_image,
+        remote_state_dir=remote_state_dir,
+        remote_logs_dir=ctx.remote_logs_dir,
+        remote_code_dir=ctx.remote_code_dir,
+        tmux_session=ctx.session_name,
+        repo_root=str(ctx.repo_root),
+        name=ctx.name,
+        machine_config=machine_cfg_dict,
+        extra={"dph_total": machine.dph_total} if machine.dph_total else None,
     )
 
     # Summary
@@ -236,6 +250,24 @@ def run_remote(ctx: RunContext) -> None:
     if ctx.pod_id and ctx.provider in ("vast.ai", "vastai"):
         log.info(f"  Stop instance: beam stop {ctx.session_name}")
     log.info("")
+
+
+def _snapshot_machine_config(ctx: RunContext) -> dict | None:
+    """Serialize the machine config that was used, for pulse restart."""
+    name = ctx.pod_config_name
+    if ctx.provider == "runpod":
+        for mc in ctx.cfg.providers.runpod.configs:
+            if mc.name == name:
+                return mc.model_dump()
+        if ctx.cfg.providers.runpod.configs:
+            return ctx.cfg.providers.runpod.configs[0].model_dump()
+    elif ctx.provider in ("vast.ai", "vastai"):
+        for mc in ctx.cfg.providers.vastai.configs:
+            if mc.name == name:
+                return mc.model_dump()
+        if ctx.cfg.providers.vastai.configs:
+            return ctx.cfg.providers.vastai.configs[0].model_dump()
+    return None
 
 
 def _get_recovery_policy(ctx: RunContext) -> str:

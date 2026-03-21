@@ -6,7 +6,7 @@ import subprocess
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import IO
+from typing import IO, Callable
 
 from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type
 
@@ -209,8 +209,24 @@ class SSHClient:
                 time.sleep(interval)
         raise SSHError(f"rsync failed after {attempts} attempts")
 
-    def wait_for_ssh(self, max_wait: int = 180, initial_delay: int = 15) -> bool:
-        """Poll until SSH is reachable. Returns True on success."""
+    def wait_for_ssh(
+        self,
+        max_wait: int = 600,
+        initial_delay: int = 15,
+        status_fn: "Callable[[], dict | None] | None" = None,
+    ) -> bool:
+        """Poll until SSH is reachable. Returns True on success.
+
+        *status_fn*, if provided, is called each iteration and should return
+        a dict with optional keys:
+
+        - ``"status"``  – human-readable status string for logging.
+        - ``"stop"``    – if truthy, abort immediately and return False.
+        - ``"message"`` – reason string logged when stopping.
+
+        This lets callers inject provider-level health checks (e.g. outbid
+        detection) without coupling ssh.py to any specific provider.
+        """
         import time
 
         if initial_delay > 0:
@@ -221,13 +237,29 @@ class SSHClient:
         elapsed = initial_delay
         interval = 10
         while elapsed < max_wait:
+            # Check provider status first — bail early if instance is dead
+            status_label = ""
+            if status_fn is not None:
+                try:
+                    result = status_fn()
+                except Exception:
+                    result = None
+                if result:
+                    status_label = result.get("status", "")
+                    if result.get("stop"):
+                        msg = result.get("message", "instance unhealthy")
+                        log.warn(f"SSH wait aborted: {msg}")
+                        return False
+
             try:
                 if self.check():
                     log.done("SSH connection verified.")
                     return True
             except Exception:
                 pass
-            log.info(f"  Waiting for SSH ... ({elapsed}s / {max_wait}s)")
+
+            extra = f" [{status_label}]" if status_label else ""
+            log.info(f"  Waiting for SSH ...{extra} ({elapsed}s / {max_wait}s)")
             time.sleep(interval)
             elapsed += interval
 

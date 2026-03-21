@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+import json as _json
 import os
-import shlex
 import subprocess
 import sys
 import time
@@ -12,9 +12,14 @@ from pathlib import Path
 from typing import Any
 
 from beam import log, session
-from beam.config import BeamConfig, PulseConfig, load_config
-from beam.providers.base import ProviderError
-from beam.ssh import SSHClient, SSHError, SSHInfo
+from beam.config import (
+    BeamConfig,
+    PulseConfig,
+    RunPodMachineConfig,
+    VastAIMachineConfig,
+    load_config,
+)
+from beam.ssh import SSHClient, SSHInfo
 
 
 # ---------------------------------------------------------------------------
@@ -67,6 +72,7 @@ def install_cron(
     *,
     auto_restart: bool = True,
     idle_stop: bool = False,
+    auto_stop_on_complete: bool = True,
     max_retries: int = 5,
     logs_dir: Path | None = None,
 ) -> None:
@@ -80,6 +86,8 @@ def install_cron(
         pulse_args += " --auto-restart"
     if idle_stop:
         pulse_args += " --idle-stop"
+    if auto_stop_on_complete:
+        pulse_args += " --auto-stop-on-complete"
     pulse_args += f" --max-retries {max_retries}"
 
     log_dir = logs_dir or session_file.parent
@@ -132,7 +140,7 @@ def uninstall_cron(session_id: str = "", *, logs_dir: Path | None = None) -> Non
             for f in logs_dir.glob(pat):
                 f.unlink(missing_ok=True)
         if session_id:
-            session.delete_session(logs_dir.parent, session_id)
+            session.delete_session(logs_dir, session_id)
 
     if session_id:
         log.done(f"Pulse cron job removed for session: {session_id}")
@@ -155,7 +163,10 @@ def list_cron_sessions(logs_dir: Path) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 def check_provider_status(sess: dict[str, Any]) -> str:
-    """Check instance status via the provider API. Returns normalised status."""
+    """Check instance status via the provider API. Returns normalised status.
+
+    Returns ``"outbid"`` when a Vast.ai bid instance has been outbid.
+    """
     provider = sess.get("provider", "")
     pod_id = sess.get("pod_id", "")
     if not pod_id:
@@ -169,6 +180,10 @@ def check_provider_status(sess: dict[str, Any]) -> str:
         elif provider in ("vast.ai", "vastai"):
             from beam.providers.vastai import VastAIProvider
             p = VastAIProvider(api_key=sess.get("vast_api_key"))
+            # Check outbid before generic status — outbid instances
+            # report "exited"/"stopped" which would hide the real cause.
+            if p.is_outbid(pod_id):
+                return "outbid"
             return p.get_status(pod_id)
     except Exception:
         return "api_error"
@@ -241,15 +256,97 @@ def check_gpu_usage(sess: dict[str, Any], pulse_cfg: PulseConfig | None = None) 
         return -1
 
 
+def check_job_state(sess: dict[str, Any], cfg: BeamConfig | None = None) -> dict[str, Any]:
+    """Check job state via sentinel files on the remote.
+
+    Returns a dict with at least ``{"state": <str>}``.  Possible states:
+    ``running``, ``finished``, ``failed``, ``crashed``, ``unknown``.
+    """
+    ip = sess.get("ip", "")
+    port = sess.get("port", "22")
+    state_dir = sess.get("remote_state_dir", "")
+    tmux_name = sess.get("tmux_session", "") or sess.get("session_id", "")
+    if not ip or not state_dir:
+        return {"state": "unknown"}
+
+    from beam.config import SSHConfig
+    ssh_cfg = cfg.ssh if cfg else SSHConfig()
+    info = SSHInfo(host=ip, port=str(port), user=sess.get("user", "root"),
+                   identity_file=sess.get("identity_file", ""))
+    client = SSHClient(info=info, cfg=ssh_cfg)
+
+    # Single SSH call that reads all state at once
+    check_cmd = (
+        f"echo '---FINISHED---'; cat '{state_dir}/FINISHED' 2>/dev/null || true; "
+        f"echo '---FAILED---'; cat '{state_dir}/FAILED' 2>/dev/null || true; "
+        f"echo '---RUNNING---'; cat '{state_dir}/RUNNING' 2>/dev/null || true; "
+        f"echo '---TMUX---'; tmux has-session -t '{tmux_name}' 2>/dev/null && echo alive || echo dead"
+    )
+    try:
+        result = client.run(check_cmd, check=False)
+    except Exception:
+        return {"state": "unknown"}
+
+    output = result.stdout
+    sections: dict[str, str] = {}
+    current_key = ""
+    for line in output.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("---") and stripped.endswith("---"):
+            current_key = stripped.strip("-")
+            sections[current_key] = ""
+        elif current_key:
+            sections[current_key] = (sections[current_key] + "\n" + stripped).strip()
+
+    finished_data = sections.get("FINISHED", "").strip()
+    failed_data = sections.get("FAILED", "").strip()
+    running_data = sections.get("RUNNING", "").strip()
+    tmux_alive = sections.get("TMUX", "").strip() == "alive"
+
+    if finished_data:
+        return {"state": "finished", "timestamp": finished_data}
+
+    if failed_data:
+        parts = failed_data.split("|", 1)
+        return {
+            "state": "failed",
+            "exit_code": parts[0] if parts else "?",
+            "timestamp": parts[1] if len(parts) > 1 else "",
+        }
+
+    if running_data:
+        parts = running_data.split("|", 1)
+        info_dict: dict[str, Any] = {
+            "pid": parts[0] if parts else "",
+            "started_at": parts[1] if len(parts) > 1 else "",
+        }
+        if tmux_alive:
+            return {"state": "running", **info_dict}
+        # RUNNING file exists but tmux is dead -- process crashed without cleanup
+        return {"state": "crashed", **info_dict}
+
+    return {"state": "unknown"}
+
+
+def _make_ssh_client(sess: dict[str, Any], cfg: BeamConfig | None = None) -> SSHClient:
+    """Build an SSHClient from session metadata."""
+    from beam.config import SSHConfig
+    ssh_cfg = cfg.ssh if cfg else SSHConfig()
+    info = SSHInfo(
+        host=sess.get("ip", ""),
+        port=str(sess.get("port", "22")),
+        user=sess.get("user", "root"),
+        identity_file=sess.get("identity_file", ""),
+    )
+    return SSHClient(info=info, cfg=ssh_cfg)
+
+
 # ---------------------------------------------------------------------------
 # Auto-restart
 # ---------------------------------------------------------------------------
 
-def do_auto_restart(sess: dict[str, Any], logs_dir: Path) -> bool:
-    """Re-run the full pipeline from session state. Returns True on success."""
-    log.warn("Auto-restart triggered -- re-provisioning and re-deploying ...")
-
-    # Restore env vars from session
+def _restore_env(sess: dict[str, Any]) -> None:
+    """Restore environment variables from session metadata for restarts."""
     for key, env_var in [
         ("runpod_api_key", "RUNPOD_API_KEY"),
         ("vast_api_key", "VAST_API_KEY"),
@@ -261,28 +358,260 @@ def do_auto_restart(sess: dict[str, Any], logs_dir: Path) -> bool:
         if val:
             os.environ[env_var] = val
 
+
+def _extract_name(sess: dict[str, Any]) -> str:
+    """Extract the original user-provided name from the session.
+
+    The ``name`` field is authoritative.  If absent, fall back to stripping
+    the ``-{timestamp}`` suffix from ``session_id``.
+    """
+    name = sess.get("name", "")
+    if name:
+        return name
+    sid = sess.get("session_id", "")
+    # session_id format: "{name}-{unix_ts}" or "train-{unix_ts}"
+    parts = sid.rsplit("-", 1)
+    if len(parts) == 2 and parts[1].isdigit():
+        return parts[0] if parts[0] != "train" else ""
+    return ""
+
+
+def do_auto_restart(sess: dict[str, Any], logs_dir: Path) -> bool:
+    """Re-run the full pipeline from session state. Returns True on success."""
+    _restore_env(sess)
+
+    provider = sess.get("provider", "")
+    pod_config_name = sess.get("pod_config_name", "")
+    cfg = load_config()
+
+    # If the session has a saved machine_config snapshot, inject it into
+    # the loaded config so the restart uses the exact same spec — even if
+    # beam.yaml has changed since the original run.
+    saved_mc = sess.get("machine_config")
+    if saved_mc:
+        _inject_machine_config(cfg, provider, pod_config_name, saved_mc)
+
+    # Destroy old instance before provisioning a new one — the old instance
+    # may still hold SSH port-forwarding allocations on the provider proxy.
+    _destroy_old_instance(sess)
+
+    # Determine restart strategy based on config
+    machine_id = _resolve_machine_id(cfg, provider, pod_config_name)
+    if machine_id:
+        log.warn(f"Hard restart -- machine-pinned (machine_id={machine_id})")
+    else:
+        log.warn("Hard restart -- spec-based search for cheapest matching instance")
+
     try:
         from beam.pipeline import RunContext, run_remote
 
-        cfg = load_config()
-        repo_root = Path.cwd()  # best effort
+        repo_root = Path(sess["repo_root"]) if sess.get("repo_root") else Path.cwd()
 
         ctx = RunContext(
             cfg,
             repo_root,
-            provider=sess.get("provider", ""),
-            pod_id=sess.get("pod_id", ""),
-            pod_config_name=sess.get("pod_config_name", ""),
-            ip=sess.get("ip", ""),
-            port=sess.get("port", ""),
+            provider=provider,
+            pod_id="",  # force new instance creation
+            pod_config_name=pod_config_name,
+            name=_extract_name(sess),
+            ip="",
+            port="",
             command=sess.get("command", ""),
         )
-        run_remote(ctx)
-        log.done("Auto-restart complete.")
+        old_session_id = sess.get("session_id", "")
+        try:
+            run_remote(ctx)
+        finally:
+            # Always update sess with the new pod_id so that if the pipeline
+            # fails partway (e.g. rsync), the next retry can destroy the
+            # newly created instance instead of the old (already-gone) one.
+            if ctx.pod_id and ctx.pod_id != sess.get("pod_id"):
+                log.info(f"Updating session pod_id: {sess.get('pod_id')} -> {ctx.pod_id}")
+                sess["pod_id"] = ctx.pod_id
+                sess["ip"] = ctx.ip
+                sess["port"] = ctx.port
+                # Persist updated session so next retry destroys the correct instance
+                session_id = sess.get("session_id", "")
+                if session_id:
+                    p = session.session_path(logs_dir, session_id)
+                    if p.exists():
+                        p.write_text(_json.dumps(sess, indent=2) + "\n")
+
+        # Pipeline creates a new session file — migrate the cron job to it
+        new_session_id = ctx.session_name or ""
+        if old_session_id and new_session_id and old_session_id != new_session_id:
+            # Uninstall old cron and install for the new session so the
+            # wrapper script points at the correct session file.
+            uninstall_cron(old_session_id, logs_dir=logs_dir)
+            new_session_file = session.session_path(logs_dir, new_session_id)
+            if new_session_file.exists():
+                install_cron(
+                    new_session_id,
+                    new_session_file,
+                    interval_secs=sess.get("pulse_interval", 300),
+                    auto_restart=True,
+                    idle_stop=sess.get("idle_stop", False),
+                    auto_stop_on_complete=sess.get("auto_stop_on_complete", True),
+                    max_retries=sess.get("max_retries", 5),
+                    logs_dir=logs_dir,
+                )
+            session.delete_session(logs_dir, old_session_id)
+
+        log.done("Hard restart complete.")
         return True
     except Exception as exc:
-        log.error(f"Auto-restart failed: {exc}")
+        log.error(f"Hard restart failed: {exc}")
         return False
+
+
+def _inject_machine_config(
+    cfg: BeamConfig, provider: str, pod_config_name: str, saved_mc: dict[str, Any]
+) -> None:
+    """Replace the matching machine config in *cfg* with the saved snapshot."""
+    if provider in ("vast.ai", "vastai"):
+        mc = VastAIMachineConfig(**saved_mc)
+        # Replace existing config with the same name, or append
+        for i, existing in enumerate(cfg.providers.vastai.configs):
+            if existing.name == pod_config_name:
+                cfg.providers.vastai.configs[i] = mc
+                return
+        cfg.providers.vastai.configs.insert(0, mc)
+    elif provider == "runpod":
+        mc = RunPodMachineConfig(**saved_mc)
+        for i, existing in enumerate(cfg.providers.runpod.configs):
+            if existing.name == pod_config_name:
+                cfg.providers.runpod.configs[i] = mc
+                return
+        cfg.providers.runpod.configs.insert(0, mc)
+
+
+def do_soft_restart(sess: dict[str, Any], logs_dir: Path, cfg: BeamConfig | None = None) -> bool:
+    """Re-launch the command on a healthy machine without re-provisioning.
+
+    Syncs code, kills the old tmux session, and starts a new one.
+    Falls back to do_auto_restart() if SSH is unreachable.
+    """
+    _restore_env(sess)
+
+    ip = sess.get("ip", "")
+    if not ip:
+        log.warn("Soft restart: no IP -- falling back to hard restart")
+        return do_auto_restart(sess, logs_dir)
+
+    log.warn("Soft restart -- re-syncing code and re-launching on existing machine ...")
+
+    try:
+        beam_cfg = cfg or load_config()
+        client = _make_ssh_client(sess, beam_cfg)
+        if not client.check():
+            log.warn("Soft restart: SSH unreachable -- falling back to hard restart")
+            return do_auto_restart(sess, logs_dir)
+
+        tmux_name = sess.get("tmux_session", "") or sess.get("session_id", "")
+        if tmux_name:
+            client.run(f"tmux kill-session -t '{tmux_name}' 2>/dev/null || true", check=False)
+
+        # Re-sync code
+        from beam.steps.sync_code import sync_code
+        repo_root = Path(sess["repo_root"]) if sess.get("repo_root") else Path.cwd()
+        remote_code_dir = sess.get("remote_code_dir", "")
+        if remote_code_dir:
+            log.step("Re-syncing code ...")
+            sync_code(client, repo_root, remote_code_dir)
+
+        # Re-launch command
+        command = sess.get("command", "")
+        if not command:
+            log.warn("Soft restart: no command in session -- nothing to launch")
+            return False
+
+        from beam.steps.run_remote import run_remote as launch_remote
+        remote_logs_dir = sess.get("remote_logs_dir", "")
+        remote_home = sess.get("remote_home", "/root")
+        if not remote_code_dir or not remote_logs_dir:
+            log.warn("Soft restart: missing remote paths -- falling back to hard restart")
+            return do_auto_restart(sess, logs_dir)
+
+        # Reuse the existing session name so we don't proliferate sessions
+        current_session_id = sess.get("session_id", "")
+        result = launch_remote(
+            client, command,
+            remote_code_dir=remote_code_dir,
+            remote_logs_dir=remote_logs_dir,
+            remote_home=remote_home,
+            name=_extract_name(sess),
+            reuse_session_name=current_session_id,
+        )
+        if result:
+            # Update state dir (may have changed if migrating from shared to per-session)
+            sess["tmux_session"] = result.session_name
+            sess["remote_state_dir"] = result.remote_state_dir
+            session_file = session.session_path(logs_dir, current_session_id)
+            session_file.write_text(_json.dumps(sess, indent=2) + "\n")
+
+        log.done("Soft restart complete.")
+        return True
+    except Exception as exc:
+        log.error(f"Soft restart failed: {exc}")
+        log.warn("Falling back to hard restart ...")
+        return do_auto_restart(sess, logs_dir)
+
+
+def _destroy_old_instance(sess: dict[str, Any]) -> None:
+    """Best-effort destroy of the old instance (e.g. after outbid)."""
+    provider = sess.get("provider", "")
+    pod_id = sess.get("pod_id", "")
+    if not pod_id:
+        log.info("No old pod_id to destroy — skipping.")
+        return
+    log.step(f"Destroying old instance {pod_id} (provider={provider}) ...")
+    try:
+        if provider in ("vast.ai", "vastai"):
+            from beam.providers.vastai import VastAIProvider
+            p = VastAIProvider(api_key=sess.get("vast_api_key"))
+            p.destroy_instance(pod_id)
+        elif provider == "runpod":
+            from beam.providers.runpod import RunPodProvider
+            p = RunPodProvider(api_key=sess.get("runpod_api_key"))
+            p.destroy_instance(pod_id)
+        else:
+            log.warn(f"Unknown provider '{provider}' — cannot destroy instance {pod_id}")
+    except Exception as exc:
+        log.warn(f"Failed to destroy old instance {pod_id}: {exc}")
+
+
+def _resolve_machine_id(cfg: BeamConfig, provider: str, pod_config_name: str) -> int | None:
+    """Look up machine_id from the named config, if any."""
+    if provider in ("vast.ai", "vastai"):
+        for mc in cfg.providers.vastai.configs:
+            if mc.name == pod_config_name:
+                return mc.machine_id
+        if cfg.providers.vastai.configs:
+            return cfg.providers.vastai.configs[0].machine_id
+    return None
+
+
+def do_destroy_and_restart(sess: dict[str, Any], session_id: str, logs_dir: Path) -> bool:
+    """Destroy the current instance and do a hard restart."""
+    provider = sess.get("provider", "")
+    pod_id = sess.get("pod_id", "")
+
+    if pod_id:
+        try:
+            if provider == "runpod":
+                from beam.providers.runpod import RunPodProvider
+                p = RunPodProvider(api_key=sess.get("runpod_api_key"))
+                p.destroy_instance(pod_id)
+            elif provider in ("vast.ai", "vastai"):
+                from beam.providers.vastai import VastAIProvider
+                p = VastAIProvider(api_key=sess.get("vast_api_key"))
+                p.destroy_instance(pod_id)
+        except Exception as exc:
+            log.warn(f"Destroy failed (continuing with restart): {exc}")
+        # Clear pod_id so do_auto_restart doesn't try to destroy again
+        sess["pod_id"] = ""
+
+    return do_auto_restart(sess, logs_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -323,56 +652,173 @@ def run_check(
     *,
     auto_restart: bool = False,
     idle_stop: bool = False,
+    auto_stop_on_complete: bool = False,
     max_retries: int = 5,
     pulse_cfg: PulseConfig | None = None,
 ) -> None:
     """Perform a single health check for a session."""
+    sessions_dir = logs_dir / "sessions"
+
+    # Prevent concurrent restarts: if another cron tick is already handling
+    # this session (e.g. a hard restart that takes longer than the cron
+    # interval), skip this check entirely.
+    lock_file = sessions_dir / f".pulse_lock_{session_id}"
+    _LOCK_STALE_SECS = 1800  # consider lock stale after 30 min
+    if lock_file.exists():
+        try:
+            lock_age = time.time() - lock_file.stat().st_mtime
+            if lock_age < _LOCK_STALE_SECS:
+                log.info(
+                    f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] "
+                    f"Skipping check for {session_id} -- restart in progress "
+                    f"({lock_age:.0f}s ago)"
+                )
+                return
+            # Stale lock — previous restart likely crashed, remove it
+            lock_file.unlink(missing_ok=True)
+        except Exception:
+            pass
+
     sess = session.load_session(logs_dir, session_id)
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     pcfg = pulse_cfg or PulseConfig()
+    cfg = load_config()
+
 
     # Failure tracking
-    failures_file = logs_dir / "sessions" / f".pulse_failures_{session_id}"
+    failures_file = sessions_dir / f".pulse_failures_{session_id}"
     consecutive_failures = int(failures_file.read_text().strip()) if failures_file.exists() else 0
 
     # GPU idle tracking
-    idle_file = logs_dir / "sessions" / f".pulse_idle_{session_id}"
+    idle_file = sessions_dir / f".pulse_idle_{session_id}"
     idle_strikes = int(idle_file.read_text().strip()) if idle_file.exists() else 0
 
-    # Determine status
-    status = check_provider_status(sess)
-    # SSH fallback
-    if status in ("unknown", "api_error") and sess.get("ip"):
-        if check_ssh_reachable(sess):
-            status = "reachable"
+    # Determine instance status
+    instance_status = check_provider_status(sess)
+    if instance_status in ("unknown", "api_error") and sess.get("ip"):
+        if check_ssh_reachable(sess, cfg):
+            instance_status = "reachable"
 
-    icon = {"running": "+", "reachable": "+", "starting": "~", "created": "~"}.get(status, "x")
+    # Determine job state (only if instance is up and we have state dir info)
+    job_info: dict[str, Any] = {"state": "unknown"}
+    if instance_status in ("running", "reachable") and sess.get("remote_state_dir"):
+        job_info = check_job_state(sess, cfg)
+
+    job_state = job_info.get("state", "unknown")
+    gpu_util = -1
+    action = "none"
+
+    icon = {"running": "+", "reachable": "+", "starting": "~", "created": "~"}.get(instance_status, "x")
     label = f"pod:{sess.get('pod_id', '')} [{session_id}]"
-    log.info(f"[{now}] {icon} {label} status={status}")
+    log.info(f"[{now}] {icon} {label} instance={instance_status} job={job_state}")
 
-    if status in ("running", "reachable"):
-        failures_file.write_text("0")
+    # ----- Decision matrix -----
 
-        # GPU idle check
-        if idle_stop and sess.get("ip"):
-            gpu_util = check_gpu_usage(sess, pcfg)
-            if gpu_util < 0:
-                log.info(f"[{now}] GPU check skipped -- idle strikes reset")
-                idle_file.write_text("0")
-            elif gpu_util < pcfg.gpu_idle_threshold:
-                idle_strikes += 1
-                idle_file.write_text(str(idle_strikes))
-                log.info(
-                    f"[{now}] GPU idle -- peak_util={gpu_util}% "
-                    f"(strike {idle_strikes}/{pcfg.gpu_idle_max_strikes})"
-                )
-                if idle_strikes >= pcfg.gpu_idle_max_strikes:
-                    do_idle_stop(sess, session_id, logs_dir)
-            else:
-                log.info(f"[{now}] GPU active -- peak_util={gpu_util}% (idle strikes reset)")
-                idle_file.write_text("0")
+    def _with_lock(fn, *args, **kwargs):
+        """Run *fn* under the restart lock to prevent concurrent restarts."""
+        lock_file.write_text(str(time.time()))
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            lock_file.unlink(missing_ok=True)
 
-    elif status in ("stopped", "exited", "unreachable", "error", "unknown"):
+    if instance_status in ("running", "reachable"):
+
+        if job_state == "finished":
+            # Job completed successfully — reset all counters
+            failures_file.write_text("0")
+            log.done(f"[{now}] Job finished successfully!")
+            action = "auto_stop" if (auto_stop_on_complete or pcfg.auto_stop_on_complete) else "none"
+            if action == "auto_stop":
+                log.info(f"[{now}] Auto-stopping instance (job complete)")
+                do_idle_stop(sess, session_id, logs_dir)
+
+        elif job_state == "failed":
+            consecutive_failures += 1
+            failures_file.write_text(str(consecutive_failures))
+            exit_code = job_info.get("exit_code", "?")
+            log.warn(f"[{now}] Job failed (exit_code={exit_code}) (failure {consecutive_failures}/{max_retries})")
+            action = "soft_restart"
+            if auto_restart:
+                if consecutive_failures >= max_retries:
+                    log.error(f"[{now}] Giving up after {max_retries} failures. Removing cron.")
+                    uninstall_cron(session_id, logs_dir=logs_dir)
+                    action = "give_up"
+                else:
+                    if not _with_lock(do_soft_restart, sess, logs_dir, cfg):
+                        log.info(f"[{now}] Soft restart failed -- will retry next check")
+
+        elif job_state == "crashed":
+            consecutive_failures += 1
+            failures_file.write_text(str(consecutive_failures))
+            log.warn(f"[{now}] Job crashed (tmux dead, RUNNING sentinel stale) (failure {consecutive_failures}/{max_retries})")
+            action = "soft_restart"
+            if auto_restart:
+                if consecutive_failures >= max_retries:
+                    log.error(f"[{now}] Giving up after {max_retries} failures. Removing cron.")
+                    uninstall_cron(session_id, logs_dir=logs_dir)
+                    action = "give_up"
+                else:
+                    if not _with_lock(do_soft_restart, sess, logs_dir, cfg):
+                        log.info(f"[{now}] Soft restart failed -- will retry next check")
+
+        elif job_state == "running":
+            # Job is confirmed running — reset failure counter
+            failures_file.write_text("0")
+            # Check GPU utilisation
+            if sess.get("ip"):
+                gpu_util = check_gpu_usage(sess, pcfg)
+                if gpu_util < 0:
+                    log.info(f"[{now}] GPU check skipped (nvidia-smi unavailable)")
+                    idle_file.write_text("0")
+                elif gpu_util < pcfg.gpu_idle_threshold:
+                    idle_strikes += 1
+                    idle_file.write_text(str(idle_strikes))
+                    log.info(
+                        f"[{now}] GPU idle -- peak_util={gpu_util}% "
+                        f"(strike {idle_strikes}/{pcfg.gpu_idle_max_strikes})"
+                    )
+                    if idle_strikes >= pcfg.gpu_idle_max_strikes:
+                        action = "destroy_restart"
+                        log.warn(f"[{now}] GPU idle while job RUNNING -- destroying and restarting")
+                        if auto_restart:
+                            _with_lock(do_destroy_and_restart, sess, session_id, logs_dir)
+                            idle_file.write_text("0")
+                        elif idle_stop:
+                            do_idle_stop(sess, session_id, logs_dir)
+                else:
+                    log.info(f"[{now}] GPU active -- peak_util={gpu_util}% (idle strikes reset)")
+                    idle_file.write_text("0")
+
+        else:
+            # job_state == "unknown" -- sentinel files missing or stale.
+            # Check GPU to decide whether the instance is doing useful work.
+            if sess.get("ip"):
+                gpu_util = check_gpu_usage(sess, pcfg)
+                if gpu_util < 0:
+                    idle_file.write_text("0")
+                elif gpu_util < pcfg.gpu_idle_threshold:
+                    idle_strikes += 1
+                    idle_file.write_text(str(idle_strikes))
+                    log.info(
+                        f"[{now}] GPU idle (job unknown) -- peak_util={gpu_util}% "
+                        f"(strike {idle_strikes}/{pcfg.gpu_idle_max_strikes})"
+                    )
+                    if idle_strikes >= pcfg.gpu_idle_max_strikes:
+                        if auto_restart:
+                            action = "destroy_restart"
+                            log.warn(f"[{now}] GPU idle with unknown job state -- destroying and restarting")
+                            _with_lock(do_destroy_and_restart, sess, session_id, logs_dir)
+                            idle_file.write_text("0")
+                        elif idle_stop:
+                            action = "idle_stop"
+                            do_idle_stop(sess, session_id, logs_dir)
+                else:
+                    idle_file.write_text("0")
+
+    elif instance_status == "outbid":
+        log.warn(f"[{now}] Instance was outbid on Vast.ai — restarting")
+        action = "outbid_restart"
         consecutive_failures += 1
         failures_file.write_text(str(consecutive_failures))
 
@@ -383,19 +829,82 @@ def run_check(
                     "Removing cron job."
                 )
                 uninstall_cron(session_id, logs_dir=logs_dir)
+                action = "give_up"
+            else:
+                # do_auto_restart already destroys the old instance internally
+                if not _with_lock(do_auto_restart, sess, logs_dir):
+                    log.info(f"[{now}] Hard restart failed -- will retry next check")
+
+    elif instance_status in ("stopped", "exited", "unreachable", "error", "unknown"):
+        consecutive_failures += 1
+        failures_file.write_text(str(consecutive_failures))
+        action = "hard_restart"
+
+        if auto_restart:
+            if consecutive_failures >= max_retries:
+                log.error(
+                    f"[{now}] Giving up after {max_retries} consecutive failures. "
+                    "Removing cron job."
+                )
+                uninstall_cron(session_id, logs_dir=logs_dir)
+                action = "give_up"
             else:
                 log.info(
-                    f"[{now}] AUTO-RESTART triggered "
+                    f"[{now}] Hard restart triggered "
                     f"(attempt {consecutive_failures}/{max_retries})"
                 )
-                if do_auto_restart(sess, logs_dir):
-                    failures_file.write_text("0")
-                    idle_file.write_text("0")
-                else:
-                    log.info(f"[{now}] AUTO-RESTART failed -- will retry next check")
+                # Destroy old instance before provisioning a new one — the old
+                # instance may still hold SSH port-forwarding allocations.
+                _destroy_old_instance(sess)
+                if not _with_lock(do_auto_restart, sess, logs_dir):
+                    log.info(f"[{now}] Hard restart failed -- will retry next check")
 
-    elif status in ("api_error", "check_error"):
-        log.info(f"[{now}] Transient error ({status}) -- will retry next check")
+    elif instance_status in ("api_error", "check_error"):
+        log.info(f"[{now}] Transient error ({instance_status}) -- will retry next check")
+
+    # Append to pulse history log
+    _append_history(logs_dir, session_id, {
+        "ts": now,
+        "instance_status": instance_status,
+        "job_state": job_state,
+        "gpu_util": gpu_util,
+        "action": action,
+        "consecutive_failures": consecutive_failures,
+        "idle_strikes": idle_strikes,
+    })
+
+
+
+# ---------------------------------------------------------------------------
+# Pulse history audit log
+# ---------------------------------------------------------------------------
+
+def _append_history(logs_dir: Path, session_id: str, entry: dict[str, Any]) -> None:
+    """Append a single check result to the JSONL audit log."""
+    history_file = logs_dir / "sessions" / f"pulse_history_{session_id}.jsonl"
+    try:
+        with open(history_file, "a") as f:
+            f.write(_json.dumps(entry) + "\n")
+    except Exception:
+        pass
+
+
+def compute_session_cost(logs_dir: Path, session_id: str, sess: dict[str, Any]) -> str:
+    """Estimate cumulative cost from session creation time and dph_total."""
+    dph = sess.get("dph_total", 0)
+    if not dph:
+        return "-"
+    created = sess.get("created_at", "")
+    if not created:
+        return "-"
+    try:
+        from datetime import datetime, timezone
+        start = datetime.fromisoformat(created)
+        elapsed = (datetime.now(timezone.utc) - start).total_seconds() / 3600
+        cost = elapsed * dph
+        return f"${cost:.2f}"
+    except Exception:
+        return "-"
 
 
 # ---------------------------------------------------------------------------

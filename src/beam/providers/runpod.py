@@ -16,6 +16,27 @@ from beam.ssh import SSHInfo
 RUNPOD_API_BASE = "https://rest.runpod.io/v1"
 
 
+def _cheapest_price(gpu: dict, spot: bool, cloud_tier: str) -> float:
+    """Extract the most relevant price from a GPU type entry."""
+    INF = float("inf")
+    if spot:
+        for key in ("communitySpotPrice", "secureSpotPrice", "spotPrice"):
+            val = gpu.get(key)
+            if val is not None:
+                return float(val)
+    tier = cloud_tier.lower()
+    if tier == "secure":
+        for key in ("securePrice", "secureCloudPrice"):
+            val = gpu.get(key)
+            if val is not None:
+                return float(val)
+    for key in ("communityPrice", "communityCloudPrice", "lowestPrice"):
+        val = gpu.get(key)
+        if val is not None:
+            return float(val)
+    return INF
+
+
 class RunPodProvider(ProviderBase):
 
     def __init__(self, api_key: str | None = None) -> None:
@@ -123,19 +144,60 @@ class RunPodProvider(ProviderBase):
 
     # -- polling ---------------------------------------------------------------
 
+    _LOADING_TIMEOUT = 600
+
     def wait_ready(self, instance_id: str, timeout: int = 300) -> None:
         log.step(f"Waiting for pod {instance_id} to become ready ...")
         elapsed = 0
         interval = 10
-        while elapsed < timeout:
-            status = self.get_status(instance_id)
-            if status == "running":
+        effective_timeout = timeout
+        loading_extended = False
+
+        while elapsed < effective_timeout:
+            try:
+                info = self.get_pod(instance_id)
+            except ProviderError:
+                log.info(f"  Waiting ... status=api_error ({elapsed}s / {effective_timeout}s)")
+                time.sleep(interval)
+                elapsed += interval
+                continue
+
+            desired = info.get("desiredStatus", "")
+            runtime = info.get("runtime") or {}
+            runtime_status = runtime.get("status", "")
+
+            if runtime_status and runtime_status.lower() == "running":
                 log.done("Pod is running.")
                 return
-            log.info(f"  Waiting ... status={status} ({elapsed}s / {timeout}s)")
+
+            # Fallback: publicIp + portMappings indicate the container is up
+            # (handles REST API responses that lack runtime.status)
+            public_ip = info.get("publicIp", "")
+            port_mappings = info.get("portMappings") or {}
+            if public_ip and port_mappings:
+                log.done("Pod is running (SSH info available).")
+                return
+
+            if desired in ("EXITED", "TERMINATED"):
+                raise ProviderError(
+                    f"Pod {instance_id} was interrupted (desiredStatus={desired}). "
+                    f"The spot instance may have been reclaimed."
+                )
+
+            if desired == "RUNNING" and not loading_extended:
+                loading_extended = True
+                if effective_timeout < self._LOADING_TIMEOUT:
+                    effective_timeout = self._LOADING_TIMEOUT
+                    log.info(
+                        f"  Pod is initializing (possible docker image pull) — "
+                        f"extending timeout to {effective_timeout}s"
+                    )
+
+            status_display = runtime_status or f"initializing (desired={desired})"
+            log.info(f"  Waiting ... status={status_display} ({elapsed}s / {effective_timeout}s)")
             time.sleep(interval)
             elapsed += interval
-        raise ProviderError(f"Pod did not become ready within {timeout}s")
+        raise ProviderError(f"Pod did not become ready within {effective_timeout}s")
 
     def wait_ssh_info(self, instance_id: str, timeout: int = 120) -> SSHInfo:
         log.step(f"Retrieving SSH info for pod {instance_id} ...")
@@ -150,6 +212,47 @@ class RunPodProvider(ProviderBase):
             time.sleep(interval)
             elapsed += interval
         raise ProviderError(f"SSH info not available after {timeout}s")
+
+    # -- GPU type listing ------------------------------------------------------
+
+    def list_gpu_types(
+        self, cfg: RunPodMachineConfig | None = None
+    ) -> list[dict]:
+        """Return available GPU types from the RunPod API.
+
+        If *cfg* is provided, results are filtered by the config's ``gpu_type``
+        and ``max_cost`` constraints.  Each returned dict contains at minimum:
+        ``id``, ``displayName``, ``memoryInGb``, and pricing fields.
+        """
+        code, body = self._request("GET", "/gpu-types")
+        if code != 200:
+            raise ProviderError(f"GET /gpu-types returned HTTP {code}: {body}")
+
+        if isinstance(body, list):
+            gpu_types = body
+        elif isinstance(body, dict):
+            gpu_types = body.get("gpuTypes", body.get("gpu_types", []))
+            if not gpu_types and "id" in body:
+                gpu_types = [body]
+        else:
+            gpu_types = []
+
+        if cfg:
+            if cfg.gpu_type:
+                needle = cfg.gpu_type.lower()
+                gpu_types = [
+                    t for t in gpu_types
+                    if needle in str(t.get("id", "")).lower()
+                    or needle in str(t.get("displayName", "")).lower()
+                ]
+            if cfg.max_cost is not None:
+                gpu_types = [
+                    t for t in gpu_types
+                    if _cheapest_price(t, cfg.spot, cfg.cloud_tier) <= cfg.max_cost
+                ]
+
+        gpu_types.sort(key=lambda t: _cheapest_price(t, cfg.spot if cfg else False, cfg.cloud_tier if cfg else "community"))
+        return gpu_types
 
     # -- JSON builder ----------------------------------------------------------
 

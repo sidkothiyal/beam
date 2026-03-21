@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import time
+from dataclasses import dataclass
 
 import httpx
 
@@ -12,7 +13,24 @@ from beam.config import VastAIMachineConfig
 from beam.providers.base import ProviderBase, ProviderError
 from beam.ssh import SSHInfo
 
+
+class OutbidError(ProviderError):
+    """Raised when an interruptible instance is outbid."""
+
+    def __init__(self, instance_id: str, msg: str = ""):
+        self.instance_id = instance_id
+        super().__init__(msg or f"Instance {instance_id} was outbid")
+
 VAST_API_BASE = "https://console.vast.ai/api/v0"
+
+
+@dataclass
+class ResolvedOffer:
+    offer_id: str
+    dph_total: float = 0.0
+    gpu_name: str = ""
+    num_gpus: int = 0
+    bid_price: float = 0.0
 
 
 class VastAIProvider(ProviderBase):
@@ -50,7 +68,7 @@ class VastAIProvider(ProviderBase):
         if code != 200:
             raise ProviderError(f"GET /instances/{instance_id}/ returned HTTP {code}")
         if isinstance(body, dict) and "instances" in body:
-            return body["instances"]
+            return body["instances"] or {}
         return body if isinstance(body, dict) else {}
 
     def search_offers(self, body: dict) -> list[dict]:
@@ -119,9 +137,13 @@ class VastAIProvider(ProviderBase):
 
     def destroy_instance(self, instance_id: str) -> None:
         log.step(f"Destroying Vast.ai instance {instance_id} ...")
-        code, _ = self._request("DELETE", f"/instances/{instance_id}/")
-        if code not in (200, 204):
-            log.warn(f"Destroy instance returned HTTP {code}")
+        code, body = self._request("DELETE", f"/instances/{instance_id}/")
+        if code in (200, 204):
+            log.done(f"Instance {instance_id} destroyed.")
+        elif code == 404:
+            log.info(f"Instance {instance_id} already gone (HTTP 404)")
+        else:
+            log.warn(f"Destroy instance returned HTTP {code}: {body}")
 
     # -- status ----------------------------------------------------------------
 
@@ -136,6 +158,15 @@ class VastAIProvider(ProviderBase):
                 return str(val).lower()
         return "unknown"
 
+    def is_outbid(self, instance_id: str) -> bool:
+        """Check if an instance was outbid. Safe to call from pulse."""
+        try:
+            info = self.get_instance(instance_id)
+        except ProviderError:
+            return False
+        # Use a generous elapsed value so the heuristic fires
+        return self._is_outbid(info, elapsed=60)
+
     def get_ssh_info(self, instance_id: str) -> SSHInfo | None:
         info = self.get_instance(instance_id)
         host = info.get("ssh_host", "")
@@ -146,16 +177,101 @@ class VastAIProvider(ProviderBase):
 
     # -- polling ---------------------------------------------------------------
 
-    def wait_ready(self, instance_id: str, timeout: int = 300) -> None:
+    _OUTBID_GRACE_SECONDS = 10
+
+    _TERMINAL_STATES = frozenset({"stopped", "exited"})
+    _HEALTHY_STATES = frozenset({"running", "loading", "creating", "connecting"})
+
+    @staticmethod
+    def _is_outbid(info: dict, elapsed: int = 0) -> bool:
+        """Return True if instance info indicates an outbid condition.
+
+        The Vast.ai API does not surface an explicit "outbid" status; the
+        dashboard derives it client-side.  We detect it three ways:
+
+        1. Explicit text -- any status field containing "outbid" (future-proof).
+        2. Heuristic -- after the grace period, if the resolved status (first
+           non-empty of cur_state / actual_status / intended_status) is stuck
+           in a terminal state ("stopped" / "exited") and no field shows a
+           healthy state, the instance is dead-on-arrival.
+        3. Empty info -- API returned nothing after the grace period.
+        """
+        if not info:
+            return elapsed >= VastAIProvider._OUTBID_GRACE_SECONDS
+
+        # 1. Explicit outbid text in any field
+        for field in ("status_msg", "cur_state", "actual_status",
+                       "intended_status", "next_state"):
+            if "outbid" in str(info.get(field, "")).lower():
+                return True
+
+        # 2. Both cur_state and intended_status are "stopped" — the provider
+        #    never intended to run this instance, i.e. it was outbid immediately.
+        cur = str(info.get("cur_state", "")).lower()
+        intended = str(info.get("intended_status", "")).lower()
+        if cur == "stopped" and intended == "stopped":
+            return True
+
+        if elapsed < VastAIProvider._OUTBID_GRACE_SECONDS:
+            return False
+
+        # 2. Check actual state fields (not intended_status, which is
+        #    aspirational — it stays "running" even when the instance is dead)
+        actual_statuses = set()
+        for field in ("cur_state", "actual_status"):
+            val = str(info.get(field, "")).lower()
+            if val:
+                actual_statuses.add(val)
+
+        # If any actual field shows a healthy state, the instance is progressing
+        if actual_statuses & VastAIProvider._HEALTHY_STATES:
+            return False
+
+        # If the actual status is terminal, the instance is dead
+        if actual_statuses & VastAIProvider._TERMINAL_STATES:
+            return True
+
+        return False
+
+    def check_outbid(self, instance_id: str) -> bool:
+        """Check if an instance is currently in an outbid state."""
+        try:
+            info = self.get_instance(instance_id)
+        except ProviderError:
+            info = {}
+        return self._is_outbid(info, elapsed=self._OUTBID_GRACE_SECONDS)
+
+    def wait_ready(self, instance_id: str, timeout: int = 600) -> None:
         log.step(f"Waiting for instance {instance_id} to become ready ...")
         elapsed = 0
         interval = 10
+
         while elapsed < timeout:
-            status = self.get_status(instance_id)
+            try:
+                info = self.get_instance(instance_id)
+            except ProviderError:
+                info = {}
+
+            log.debug(f"  Instance info: {info}")
+
+            if self._is_outbid(info, elapsed):
+                raise OutbidError(instance_id)
+
+            status = ""
+            for field in ("cur_state", "actual_status", "intended_status"):
+                val = info.get(field, "")
+                if val:
+                    status = str(val).lower()
+                    break
+
             if status == "running":
                 log.done("Instance is running.")
                 return
-            log.info(f"  Waiting ... status={status} ({elapsed}s / {timeout}s)")
+
+            cur = str(info.get("cur_state", "")).lower()
+            actual = str(info.get("actual_status", "")).lower()
+            intended = str(info.get("intended_status", "")).lower()
+            log.info(f"  Waiting ... cur={cur} actual={actual} intended={intended} ({elapsed}s / {timeout}s)")
             time.sleep(interval)
             elapsed += interval
         raise ProviderError(f"Instance did not become ready within {timeout}s")
@@ -165,11 +281,22 @@ class VastAIProvider(ProviderBase):
         elapsed = 0
         interval = 10
         while elapsed < timeout:
-            ssh = self.get_ssh_info(instance_id)
-            if ssh:
+            try:
+                info = self.get_instance(instance_id)
+            except ProviderError:
+                info = {}
+
+            if self._is_outbid(info, elapsed=self._OUTBID_GRACE_SECONDS):
+                raise OutbidError(instance_id)
+
+            host = info.get("ssh_host", "")
+            port = info.get("ssh_port", "")
+            if host and port:
+                ssh = SSHInfo(host=str(host), port=str(port))
                 log.done(f"SSH ready: {ssh.host}:{ssh.port}")
                 return ssh
-            log.info(f"  Waiting for SSH info ... ({elapsed}s / {timeout}s)")
+            status = str(info.get("cur_state", "") or info.get("actual_status", "")).lower()
+            log.info(f"  Waiting for SSH info ... status={status} ({elapsed}s / {timeout}s)")
             time.sleep(interval)
             elapsed += interval
         raise ProviderError(f"SSH info not available after {timeout}s")
@@ -198,36 +325,213 @@ class VastAIProvider(ProviderBase):
     @staticmethod
     def build_search_body(cfg: VastAIMachineConfig) -> dict:
         """Build the search-offers body."""
+        is_bid = cfg.offer_type == "bid"
         body: dict = {
             "limit": cfg.offer_limit,
             "type": cfg.offer_type,
             "verified": {"eq": True},
             "rentable": {"eq": True},
             "rented": {"eq": False},
+            "order": [["min_bid" if is_bid else "dph_total", "asc"]],
         }
         if cfg.gpu_name:
             body["gpu_name"] = {"eq": cfg.gpu_name}
-        if cfg.num_gpus:
-            body["num_gpus"] = {"gte": cfg.num_gpus}
+        if cfg.num_gpus or cfg.num_gpus_max is not None:
+            gpu_filter: dict = {}
+            if cfg.num_gpus:
+                gpu_filter["gte"] = cfg.num_gpus
+            if cfg.num_gpus_max is not None:
+                gpu_filter["lte"] = cfg.num_gpus_max
+            body["num_gpus"] = gpu_filter
+        if cfg.gpu_ram_min is not None:
+            body["gpu_ram"] = {"gte": cfg.gpu_ram_min * 1024}
         if cfg.machine_id:
             body["machine_id"] = {"eq": cfg.machine_id}
         if cfg.disk_gb:
             body["disk_space"] = {"gte": cfg.disk_gb}
         if cfg.reliability_min is not None:
             body["reliability"] = {"gte": cfg.reliability_min}
-        if cfg.dph_max is not None:
-            body["dph_total"] = {"lte": cfg.dph_max}
+        price_cap = cfg.dph_max or cfg.price_max
+        if price_cap is not None:
+            if is_bid:
+                body["min_bid"] = {"lte": price_cap}
+            else:
+                body["dph_total"] = {"lte": price_cap}
+        if cfg.dlperf_min is not None:
+            body["dlperf"] = {"gte": cfg.dlperf_min}
+        if cfg.dlperf_per_dphtotal_min is not None:
+            body["dlperf_per_dphtotal"] = {"gte": cfg.dlperf_per_dphtotal_min}
         return body
 
-    def resolve_offer_id(self, cfg: VastAIMachineConfig) -> str:
-        """Search for an offer matching the config and return its ID."""
+    # -- pick & bid strategies -------------------------------------------------
+
+    _VALID_PICK_STRATEGIES = frozenset({"cheapest", "best_value", "score"})
+    _VALID_BID_STRATEGIES = frozenset({"multiplier", "percentile", "fixed"})
+
+    @staticmethod
+    def _rank_offers(offers: list[dict], cfg: VastAIMachineConfig) -> None:
+        """Sort *offers* in-place according to ``cfg.pick_strategy``."""
+        pick = cfg.pick_strategy
+        INF = float("inf")
+
+        if pick == "cheapest":
+            offers.sort(key=lambda o: o.get("min_bid", INF))
+        elif pick == "best_value":
+            offers.sort(key=lambda o: o.get("dlperf_per_dphtotal", 0.0), reverse=True)
+        elif pick == "score":
+            for o in offers:
+                mb = max(o.get("min_bid", INF), 0.001)
+                o["_score"] = o.get("dlperf", 0.0) * o.get("reliability", 0.0) / mb
+            offers.sort(key=lambda o: o.get("_score", 0.0), reverse=True)
+        else:
+            raise ProviderError(
+                f"Unknown pick_strategy '{pick}'. "
+                f"Valid: {', '.join(sorted(VastAIProvider._VALID_PICK_STRATEGIES))}"
+            )
+
+    @staticmethod
+    def _compute_bid(offer: dict, offers: list[dict], cfg: VastAIMachineConfig) -> float:
+        """Compute the bid price for *offer* according to ``cfg.bid_strategy``."""
+        min_bid = offer.get("min_bid", 0.0)
+
+        def _clamp(price: float) -> float:
+            price = max(price, min_bid, cfg.price)
+            if cfg.price_max is not None:
+                price = min(price, cfg.price_max)
+            return round(price, 4)
+
+        strategy = cfg.bid_strategy
+
+        if strategy == "fixed":
+            return _clamp(cfg.price)
+
+        if strategy == "multiplier":
+            return _clamp(min_bid * cfg.bid_multiplier)
+
+        if strategy == "percentile":
+            all_bids = sorted(o.get("min_bid", 0.0) for o in offers)
+            idx = min(int(len(all_bids) * cfg.bid_percentile), len(all_bids) - 1)
+            return _clamp(all_bids[idx])
+
+        raise ProviderError(
+            f"Unknown bid_strategy '{strategy}'. "
+            f"Valid: {', '.join(sorted(VastAIProvider._VALID_BID_STRATEGIES))}"
+        )
+
+    @staticmethod
+    def _apply_bid_strategy(
+        offers: list[dict], cfg: VastAIMachineConfig
+    ) -> tuple[dict, float]:
+        """Select an offer and compute a bid price.
+
+        Uses ``cfg.pick_strategy`` to rank offers and ``cfg.bid_strategy``
+        to determine the bid price.  For on-demand offers both are ignored
+        and the cheapest offer is returned with price 0.
+        """
+        if cfg.offer_type != "bid":
+            offers.sort(key=lambda o: o.get("dph_total", float("inf")))
+            return offers[0], 0.0
+
+        VastAIProvider._rank_offers(offers, cfg)
+        offer = offers[0]
+        bid = VastAIProvider._compute_bid(offer, offers, cfg)
+        return offer, bid
+
+    # -- offer listing ---------------------------------------------------------
+
+    def list_compatible_offers(
+        self, cfg: VastAIMachineConfig
+    ) -> list[dict]:
+        """Return all matching offers sorted according to ``cfg.pick_strategy``.
+
+        Each offer dict is augmented with ``_computed_bid`` (the bid price the
+        bid strategy would produce) so callers can display it.
+        """
         search_body = self.build_search_body(cfg)
-        log.step("Searching for offers ...")
         offers = self.search_offers(search_body)
         if not offers:
+            return []
+
+        is_bid = cfg.offer_type == "bid"
+
+        if is_bid:
+            self._rank_offers(offers, cfg)
+            for o in offers:
+                o["_computed_bid"] = self._compute_bid(o, offers, cfg)
+        else:
+            offers.sort(key=lambda o: o.get("dph_total", INF))
+            for o in offers:
+                o["_computed_bid"] = 0.0
+
+        return offers
+
+    # -- offer resolution ------------------------------------------------------
+
+    def resolve_offer_id(
+        self,
+        cfg: VastAIMachineConfig,
+        *,
+        exclude_offer_ids: set[str] | None = None,
+    ) -> ResolvedOffer:
+        """Search for the best offer matching the config requirements.
+
+        The offer selection and bid price are determined by
+        ``cfg.bid_strategy``.
+        """
+        search_body = self.build_search_body(cfg)
+
+        reqs = []
+        if cfg.gpu_ram_min is not None:
+            reqs.append(f"vram>={cfg.gpu_ram_min}GB")
+        if cfg.gpu_name:
+            reqs.append(f"gpu={cfg.gpu_name}")
+        if cfg.num_gpus_max is not None:
+            reqs.append(f"gpus={cfg.num_gpus}..{cfg.num_gpus_max}")
+        else:
+            reqs.append(f"gpus>={cfg.num_gpus}")
+        if cfg.dlperf_min is not None:
+            reqs.append(f"dlperf>={cfg.dlperf_min}")
+        if cfg.price_max is not None:
+            reqs.append(f"max=${cfg.price_max:.4f}/hr")
+        log.step(
+            f"Searching for offers ({', '.join(reqs)}) "
+            f"[pick={cfg.pick_strategy}, bid={cfg.bid_strategy}] ..."
+        )
+
+        offers = self.search_offers(search_body)
+        if exclude_offer_ids:
+            offers = [o for o in offers if str(o.get("id", "")) not in exclude_offer_ids]
+        if not offers:
             raise ProviderError(
-                f"No offers found matching config (gpu_name={cfg.gpu_name})"
+                f"No offers found matching requirements ({', '.join(reqs)})"
             )
-        offer_id = str(offers[0].get("id", ""))
-        log.done(f"Using offer ID: {offer_id}")
-        return offer_id
+
+        offer, bid_price = self._apply_bid_strategy(offers, cfg)
+
+        offer_id = str(offer.get("id", ""))
+        gpu_name = offer.get("gpu_name", "unknown")
+        gpu_ram_mb = offer.get("gpu_ram", 0)
+        gpu_ram_gb = gpu_ram_mb / 1024 if gpu_ram_mb else 0
+        n_gpus = offer.get("num_gpus", 0)
+        dph = offer.get("dph_total", 0.0)
+        min_bid = offer.get("min_bid", 0.0)
+        dlperf = offer.get("dlperf", 0)
+
+        if cfg.offer_type == "bid":
+            price_label = f"min_bid=${min_bid:.4f}/hr  bid=${bid_price:.4f}/hr"
+        else:
+            price_label = f"${dph:.4f}/hr"
+        log.done(
+            f"Selected offer {offer_id}: "
+            f"{n_gpus}x {gpu_name} ({gpu_ram_gb:.0f}GB) "
+            f"@ {price_label}  "
+            f"dlperf={dlperf:.1f}  "
+            f"[{len(offers)} offer(s) found]"
+        )
+        return ResolvedOffer(
+            offer_id=offer_id,
+            dph_total=dph,
+            gpu_name=gpu_name,
+            num_gpus=n_gpus,
+            bid_price=bid_price,
+        )
