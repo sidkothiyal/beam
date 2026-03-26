@@ -1,0 +1,20 @@
+---
+description: beam pipeline step rules
+globs: ["src/beam/steps/**", "src/beam/pipeline.py"]
+alwaysApply: false
+---
+
+# beam — Pipeline Step Rules
+
+## Step Pattern
+Steps are plain functions (not classes) in `steps/*.py`. Each receives `SSHClient`, `BeamConfig`, and relevant context. Returns a dataclass result or `None`.
+
+## Two Pipeline Modes
+- **Registry mode** (`GITHUB_USERNAME` set): build_venv → push_image → ensure_machine → sync_venv → sync_code → setup_creds → run_remote
+- **Stream mode** (no registry): ensure_machine → build_venv → sync_venv → sync_code → setup_creds → setup_uv → run_remote
+
+## Adding a Step
+1. Create `src/beam/steps/<name>.py` with a single top-level function
+2. Register in `pipeline.py` in the appropriate pipeline variant(s)
+3. Update `RunContext` if new state needs to be carried forward
+4. Update `steps/README.md` and `steps/ARCHITECTURE.md`

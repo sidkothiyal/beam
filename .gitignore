@@ -1,0 +1,10 @@
+# Cache
+__pycache__/
+*/__pycache__/
+
+# OS
+.DS_Store
+
+# Run script artifacts
+.deps_hash
+.heavy-deps-hash

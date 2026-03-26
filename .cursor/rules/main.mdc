@@ -1,0 +1,31 @@
+---
+description: beam core patterns and conventions
+alwaysApply: true
+---
+
+# beam — Core Rules
+
+CLI for remote GPU training deployment. Provisions RunPod/Vast.ai, syncs venv+code, launches tmux jobs with Pulse monitoring. Uses `uv` + Pydantic v2 + Typer.
+
+## Commands
+```bash
+uv pip install -e .
+beam run --provider vastai python train.py
+beam status
+beam stop <id>
+```
+
+## Key Patterns
+
+1. **Config resolution:** YAML → env vars → CLI overrides → `BeamConfig` (Pydantic v2)
+2. **RunContext:** Single state dataclass passed to all pipeline steps. Derived paths are `@property`.
+3. **Providers:** All cloud ops via `ProviderBase` (7 methods). Normalised status: `running|stopped|exited|unknown|error|api_error`.
+4. **Steps:** Plain functions in `steps/*.py`, called in sequence by `pipeline.py`.
+5. **Sentinels:** Remote job state via `RUNNING`/`FINISHED`/`FAILED` files in `.beam_state/`.
+
+## Documentation
+Every `src/` subdirectory has `README.md` (usage) and `ARCHITECTURE.md` (implementation).
+**Update both files for every directory you modify.** Also update outermost `README.md` and `ARCHITECTURE.md` if changes affect project-level docs. Outdated docs are worse than no docs.
+
+## Planning
+If a task has more than 3 steps, create a plan first before executing.

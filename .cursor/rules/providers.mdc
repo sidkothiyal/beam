@@ -1,0 +1,16 @@
+---
+description: beam cloud provider rules
+globs: src/beam/providers/**
+alwaysApply: false
+---
+
+# beam — Provider Rules
+
+## ProviderBase Interface
+All providers implement 7 methods: `create_instance`, `start_instance`, `stop_instance`, `destroy_instance`, `get_status`, `get_ssh_info`, `wait_ready`. All must map native statuses to normalised values: `running|stopped|exited|unknown|error|api_error`.
+
+## Adding a New Provider
+1. Create `src/beam/providers/<name>.py` implementing `ProviderBase`
+2. Add `<Name>MachineConfig` and `<Name>ProviderConfig` to `config.py`
+3. Register in `cli.py` and `pipeline.py`
+4. Update `providers/README.md` and `providers/ARCHITECTURE.md`
