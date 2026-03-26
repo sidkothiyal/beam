@@ -746,8 +746,8 @@ def run_check(
             action = "soft_restart"
             if auto_restart:
                 if consecutive_failures >= max_retries:
-                    log.error(f"[{now}] Giving up after {max_retries} failures. Removing cron.")
-                    uninstall_cron(session_id, logs_dir=logs_dir)
+                    log.error(f"[{now}] Giving up after {max_retries} failures. Stopping instance and removing cron.")
+                    do_idle_stop(sess, session_id, logs_dir)
                     action = "give_up"
                 else:
                     if not _with_lock(do_soft_restart, sess, logs_dir, cfg):
@@ -760,8 +760,8 @@ def run_check(
             action = "soft_restart"
             if auto_restart:
                 if consecutive_failures >= max_retries:
-                    log.error(f"[{now}] Giving up after {max_retries} failures. Removing cron.")
-                    uninstall_cron(session_id, logs_dir=logs_dir)
+                    log.error(f"[{now}] Giving up after {max_retries} failures. Stopping instance and removing cron.")
+                    do_idle_stop(sess, session_id, logs_dir)
                     action = "give_up"
                 else:
                     if not _with_lock(do_soft_restart, sess, logs_dir, cfg):
@@ -831,9 +831,9 @@ def run_check(
             if consecutive_failures >= max_retries:
                 log.error(
                     f"[{now}] Giving up after {max_retries} consecutive failures. "
-                    "Removing cron job."
+                    "Stopping instance and removing cron job."
                 )
-                uninstall_cron(session_id, logs_dir=logs_dir)
+                do_idle_stop(sess, session_id, logs_dir)
                 action = "give_up"
             else:
                 # do_auto_restart already destroys the old instance internally
@@ -849,9 +849,9 @@ def run_check(
             if consecutive_failures >= max_retries:
                 log.error(
                     f"[{now}] Giving up after {max_retries} consecutive failures. "
-                    "Removing cron job."
+                    "Stopping instance and removing cron job."
                 )
-                uninstall_cron(session_id, logs_dir=logs_dir)
+                do_idle_stop(sess, session_id, logs_dir)
                 action = "give_up"
             else:
                 log.info(

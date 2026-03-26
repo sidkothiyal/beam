@@ -11,7 +11,7 @@ from typing import Optional
 import typer
 from rich.table import Table
 
-from beam import log
+from beam import log, complete
 from beam.config import (
     BeamConfig,
     RunPodMachineConfig,
@@ -41,9 +41,15 @@ def run(
     port: Optional[str] = typer.Option(None, "-p", "--port", help="SSH port"),
     identity_file: Optional[str] = typer.Option(None, "-i", help="SSH identity file"),
     user: Optional[str] = typer.Option(None, "--user", help="SSH user"),
-    provider: Optional[str] = typer.Option(None, "--provider", help="Cloud provider: runpod, vast.ai"),
+    provider: Optional[str] = typer.Option(
+        None, "--provider", help="Cloud provider: runpod, vast.ai",
+        autocompletion=complete.complete_provider,
+    ),
     pod_id: Optional[str] = typer.Option(None, "--pod-id", help="Existing pod/instance ID"),
-    pod_config: Optional[str] = typer.Option(None, "--pod-config", help="Named machine config from beam.yaml"),
+    pod_config: Optional[str] = typer.Option(
+        None, "--pod-config", help="Named machine config from beam.yaml",
+        autocompletion=complete.complete_pod_config,
+    ),
     name: Optional[str] = typer.Option(None, "--name", "-n", help="Custom session name for easier tracking"),
     remote_project_dir: Optional[str] = typer.Option(None, "--remote-project-dir", help="Remote workspace root"),
     remote_home: Optional[str] = typer.Option(None, "--remote-home", help="Remote home directory"),
@@ -121,7 +127,7 @@ def run(
 
 @app.command()
 def status(
-    live: bool = typer.Option(False, "--live", help="SSH into remotes to check job state (slower)"),
+    live: bool = typer.Option(True, "--live/--offline", help="SSH into remotes to check job state (use --offline to skip)"),
     config_file: Optional[str] = typer.Option(None, "--config", help="Path to beam.yaml"),
 ) -> None:
     """Show all active sessions."""
@@ -256,6 +262,7 @@ pulse:
     target.write_text(content)
     log.done(f"Created {target}")
     log.info("Edit it to match your project, then run: beam run --provider <name> -- <command>")
+    _hint_completion()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -264,8 +271,14 @@ pulse:
 
 @app.command()
 def offers(
-    provider: str = typer.Option(..., "--provider", help="Cloud provider: runpod, vast.ai"),
-    pod_config: Optional[str] = typer.Option(None, "--pod-config", help="Named machine config from beam.yaml"),
+    provider: str = typer.Option(
+        ..., "--provider", help="Cloud provider: runpod, vast.ai",
+        autocompletion=complete.complete_provider,
+    ),
+    pod_config: Optional[str] = typer.Option(
+        None, "--pod-config", help="Named machine config from beam.yaml",
+        autocompletion=complete.complete_pod_config,
+    ),
     config_file: Optional[str] = typer.Option(None, "--config", help="Path to beam.yaml"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
     quiet: bool = typer.Option(False, "--quiet", "-q", help="Quiet output"),
@@ -481,7 +494,10 @@ def _list_runpod_offers(cfg: BeamConfig, pod_config_name: str | None) -> None:
 
 @app.command()
 def attach(
-    session_id: str = typer.Argument(..., help="Session ID to attach to"),
+    session_id: str = typer.Argument(
+        ..., help="Session ID to attach to",
+        autocompletion=complete.complete_session_id,
+    ),
     config_file: Optional[str] = typer.Option(None, "--config"),
 ) -> None:
     """SSH into the remote and attach to the tmux session."""
@@ -508,7 +524,10 @@ def attach(
 
 @app.command()
 def logs(
-    session_id: str = typer.Argument(..., help="Session ID"),
+    session_id: str = typer.Argument(
+        ..., help="Session ID",
+        autocompletion=complete.complete_session_id,
+    ),
     follow: bool = typer.Option(True, "--follow/--no-follow", "-f", help="Follow log output"),
     config_file: Optional[str] = typer.Option(None, "--config"),
 ) -> None:
@@ -545,7 +564,10 @@ def logs(
 
 @app.command()
 def stop(
-    session_id: str = typer.Argument(..., help="Session ID to stop"),
+    session_id: str = typer.Argument(
+        ..., help="Session ID to stop",
+        autocompletion=complete.complete_session_id,
+    ),
     config_file: Optional[str] = typer.Option(None, "--config"),
 ) -> None:
     """Stop the instance and remove pulse cron for a session."""
@@ -604,7 +626,10 @@ def pulse_list(
 
 @pulse_app.command("install")
 def pulse_install(
-    session_id: str = typer.Option(..., "--session", help="Session ID"),
+    session_id: str = typer.Option(
+        ..., "--session", help="Session ID",
+        autocompletion=complete.complete_session_id,
+    ),
     interval: str = typer.Option("5m", "--interval", help="Check interval (e.g. 5m, 1h)"),
     auto_restart: bool = typer.Option(True, "--auto-restart/--no-auto-restart"),
     idle_stop: bool = typer.Option(False, "--idle-stop"),
@@ -639,7 +664,10 @@ def pulse_install(
 
 @pulse_app.command("uninstall")
 def pulse_uninstall(
-    session_id: Optional[str] = typer.Option(None, "--session", help="Session ID (omit for all)"),
+    session_id: Optional[str] = typer.Option(
+        None, "--session", help="Session ID (omit for all)",
+        autocompletion=complete.complete_session_id,
+    ),
     all_sessions: bool = typer.Option(False, "--all", help="Remove all pulse cron jobs"),
     config_file: Optional[str] = typer.Option(None, "--config"),
 ) -> None:
@@ -662,7 +690,10 @@ def pulse_uninstall(
 @pulse_app.command("check")
 def pulse_check(
     session_file: Optional[str] = typer.Option(None, "--session-file", help="Session JSON file"),
-    session_id: Optional[str] = typer.Option(None, "--session", help="Session ID"),
+    session_id: Optional[str] = typer.Option(
+        None, "--session", help="Session ID",
+        autocompletion=complete.complete_session_id,
+    ),
     auto_restart: bool = typer.Option(False, "--auto-restart"),
     idle_stop: bool = typer.Option(False, "--idle-stop"),
     auto_stop_on_complete: bool = typer.Option(False, "--auto-stop-on-complete"),
@@ -719,6 +750,57 @@ def _load_session_or_exit(session_id: str, config_file: str | None) -> dict:
         log.error(f"Session not found: {session_id}")
         log.info("Run 'beam status' to see active sessions.")
         raise typer.Exit(1)
+
+
+def _hint_completion() -> None:
+    """Auto-install shell completion if not already set up.
+
+    Runs ``beam --install-completion <shell>`` silently, then tells the user
+    to source their shell config. That source step is the only thing Python
+    can't do — it must happen in the user's shell process.
+    """
+    shell = os.environ.get("SHELL", "")
+    shell_name = Path(shell).name if shell else "bash"
+
+    # Map each shell to the file Typer writes its completion hook into
+    rc_files: dict[str, Path] = {
+        "bash": Path.home() / ".bashrc",
+        "zsh": Path.home() / ".zshrc",
+        "fish": Path.home() / ".config" / "fish" / "completions" / "beam.fish",
+    }
+
+    # --- Already installed? Check rc file for beam completion marker ---
+    rc = rc_files.get(shell_name)
+    if rc and rc.exists():
+        try:
+            if "beam" in rc.read_text(errors="ignore"):
+                return  # already present, nothing to do
+        except OSError:
+            pass
+
+    # --- Run install-completion automatically ---
+    beam_exe = sys.argv[0]  # path to the running beam binary
+    try:
+        result = subprocess.run(
+            [beam_exe, "--install-completion", shell_name],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            source_cmd = f"source {rc}" if rc else f"source ~/.{shell_name}rc"
+            log.success(
+                f"✓ Tab completion installed for {shell_name}.\n"
+                f"  Run this to activate in your current shell:\n"
+                f"    {source_cmd}"
+            )
+        else:
+            # Install failed — fall back to a manual hint
+            log.info(
+                f"Tip: enable Tab completion (session IDs, providers, configs):\n"
+                f"  beam --install-completion {shell_name}"
+            )
+    except Exception:
+        pass  # never break beam init because of completion setup
 
 
 def main() -> None:
