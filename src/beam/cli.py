@@ -45,9 +45,9 @@ def _global_options(
         _state["config_file"] = config
 
 
-def _resolve_config_path(config_file: Optional[str]) -> Optional[Path]:
-    """Return a Path for the config file, honouring global --config fallback."""
-    path = config_file or _state["config_file"]
+def _resolve_config_path() -> Optional[Path]:
+    """Return a Path for the config file from the global --config flag."""
+    path = _state["config_file"]
     return Path(path) if path else None
 
 
@@ -76,7 +76,6 @@ def run(
     pulse_interval: Optional[str] = typer.Option(None, "--pulse", help="Pulse cron interval (e.g. 5m, 1h)"),
     pulse_idle_stop: bool = typer.Option(False, "--pulse-idle-stop", help="Stop when GPU idle"),
     no_auto_stop_on_complete: bool = typer.Option(False, "--no-auto-stop-on-complete", help="Don't auto-stop when job finishes"),
-    config_file: Optional[str] = typer.Option(None, "--config", help="Path to beam.yaml"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
     quiet: bool = typer.Option(False, "--quiet", "-q", help="Quiet output"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Show what would be done"),
@@ -96,7 +95,7 @@ def run(
     if identity_file:
         overrides["ssh.identity_file"] = identity_file
 
-    cfg_path = _resolve_config_path(config_file)
+    cfg_path = _resolve_config_path()
     cfg = load_config(config_path=cfg_path, overrides=overrides)
     repo_root = get_project_root(cfg_path)
 
@@ -148,10 +147,9 @@ def run(
 @app.command()
 def status(
     live: bool = typer.Option(True, "--live/--offline", help="SSH into remotes to check job state (use --offline to skip)"),
-    config_file: Optional[str] = typer.Option(None, "--config", help="Path to beam.yaml"),
 ) -> None:
     """Show all active sessions."""
-    cfg_path = _resolve_config_path(config_file)
+    cfg_path = _resolve_config_path()
     cfg = load_config(config_path=cfg_path) if live else None
     repo_root = get_project_root(cfg_path)
     logs_dir = repo_root / ".beam" / "logs"
@@ -299,14 +297,13 @@ def offers(
         None, "--pod-config", help="Named machine config from beam.yaml",
         autocompletion=complete.complete_pod_config,
     ),
-    config_file: Optional[str] = typer.Option(None, "--config", help="Path to beam.yaml"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
     quiet: bool = typer.Option(False, "--quiet", "-q", help="Quiet output"),
 ) -> None:
     """List compatible GPU instances available for the given config."""
     log.set_verbosity(verbose=verbose, quiet=quiet)
 
-    cfg_path = _resolve_config_path(config_file)
+    cfg_path = _resolve_config_path()
     cfg = load_config(config_path=cfg_path)
 
     if provider in ("vast.ai", "vastai"):
@@ -518,10 +515,9 @@ def attach(
         ..., help="Session ID to attach to",
         autocompletion=complete.complete_session_id,
     ),
-    config_file: Optional[str] = typer.Option(None, "--config"),
 ) -> None:
     """SSH into the remote and attach to the tmux session."""
-    sess = _load_session_or_exit(session_id, config_file)
+    sess = _load_session_or_exit(session_id)
     ip = sess.get("ip", "")
     port = sess.get("port", "22")
     user = sess.get("user", "root")
@@ -549,10 +545,9 @@ def logs(
         autocompletion=complete.complete_session_id,
     ),
     follow: bool = typer.Option(True, "--follow/--no-follow", "-f", help="Follow log output"),
-    config_file: Optional[str] = typer.Option(None, "--config"),
 ) -> None:
     """Tail remote logs for a session."""
-    sess = _load_session_or_exit(session_id, config_file)
+    sess = _load_session_or_exit(session_id)
     ip = sess.get("ip", "")
     port = sess.get("port", "22")
     user = sess.get("user", "root")
@@ -562,8 +557,7 @@ def logs(
 
     if not remote_logs_dir:
         remote_project_dir = sess.get("remote_project_dir", "/workspace")
-        cfg_path = _resolve_config_path(config_file)
-        cfg = load_config(config_path=cfg_path)
+        cfg = load_config(config_path=_resolve_config_path())
         repo_name = cfg.project.name or Path.cwd().name
         remote_logs_dir = f"{remote_project_dir}/logs/{repo_name}"
 
@@ -588,13 +582,12 @@ def stop(
         ..., help="Session ID to stop",
         autocompletion=complete.complete_session_id,
     ),
-    config_file: Optional[str] = typer.Option(None, "--config"),
 ) -> None:
     """Stop the instance and remove pulse cron for a session."""
     from beam import pulse as pulse_mod
 
-    sess = _load_session_or_exit(session_id, config_file)
-    cfg_path = _resolve_config_path(config_file)
+    sess = _load_session_or_exit(session_id)
+    cfg_path = _resolve_config_path()
     repo_root = get_project_root(cfg_path)
     logs_dir = repo_root / ".beam" / "logs"
 
@@ -607,11 +600,9 @@ def stop(
 # ═══════════════════════════════════════════════════════════════════════════
 
 @pulse_app.command("list")
-def pulse_list(
-    config_file: Optional[str] = typer.Option(None, "--config"),
-) -> None:
+def pulse_list() -> None:
     """List all tracked sessions and their cron status."""
-    cfg_path = _resolve_config_path(config_file)
+    cfg_path = _resolve_config_path()
     repo_root = get_project_root(cfg_path)
     logs_dir = repo_root / ".beam" / "logs"
 
@@ -655,12 +646,11 @@ def pulse_install(
     idle_stop: bool = typer.Option(False, "--idle-stop"),
     auto_stop_on_complete: bool = typer.Option(True, "--auto-stop-on-complete/--no-auto-stop-on-complete"),
     max_retries: int = typer.Option(5, "--max-retries"),
-    config_file: Optional[str] = typer.Option(None, "--config"),
 ) -> None:
     """Install a pulse cron job for a session."""
     from beam import pulse as pulse_mod
 
-    cfg_path = _resolve_config_path(config_file)
+    cfg_path = _resolve_config_path()
     repo_root = get_project_root(cfg_path)
     logs_dir = repo_root / ".beam" / "logs"
 
@@ -689,12 +679,11 @@ def pulse_uninstall(
         autocompletion=complete.complete_session_id,
     ),
     all_sessions: bool = typer.Option(False, "--all", help="Remove all pulse cron jobs"),
-    config_file: Optional[str] = typer.Option(None, "--config"),
 ) -> None:
     """Remove pulse cron job(s)."""
     from beam import pulse as pulse_mod
 
-    cfg_path = _resolve_config_path(config_file)
+    cfg_path = _resolve_config_path()
     repo_root = get_project_root(cfg_path)
     logs_dir = repo_root / ".beam" / "logs"
 
@@ -718,12 +707,11 @@ def pulse_check(
     idle_stop: bool = typer.Option(False, "--idle-stop"),
     auto_stop_on_complete: bool = typer.Option(False, "--auto-stop-on-complete"),
     max_retries: int = typer.Option(5, "--max-retries"),
-    config_file: Optional[str] = typer.Option(None, "--config"),
 ) -> None:
     """Run a single health check for a session."""
     from beam import pulse as pulse_mod
 
-    cfg_path = _resolve_config_path(config_file)
+    cfg_path = _resolve_config_path()
     cfg = load_config(config_path=cfg_path)
     repo_root = get_project_root(cfg_path)
     logs_dir = repo_root / ".beam" / "logs"
@@ -759,9 +747,9 @@ def pulse_check(
 # Helpers
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _load_session_or_exit(session_id: str, config_file: str | None) -> dict:
+def _load_session_or_exit(session_id: str) -> dict:
     from beam import session as sess_mod
-    cfg_path = _resolve_config_path(config_file)
+    cfg_path = _resolve_config_path()
     repo_root = get_project_root(cfg_path)
     logs_dir = repo_root / ".beam" / "logs"
     try:
