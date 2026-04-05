@@ -8,3 +8,7 @@ __pycache__/
 # Run script artifacts
 .deps_hash
 .heavy-deps-hash
+
+# Beam
+beam.yaml
+.beam/
