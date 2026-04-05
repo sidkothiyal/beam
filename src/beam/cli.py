@@ -30,6 +30,26 @@ app = typer.Typer(
 pulse_app = typer.Typer(help="Pulse monitoring and cron management.")
 app.add_typer(pulse_app, name="pulse")
 
+_state: dict = {"config_file": None}
+
+
+@app.callback()
+def _global_options(
+    config: Optional[str] = typer.Option(
+        None, "--config", "-c",
+        help="Path to config file (default: auto-discover beam.yaml)",
+        is_eager=False,
+    ),
+) -> None:
+    if config:
+        _state["config_file"] = config
+
+
+def _resolve_config_path(config_file: Optional[str]) -> Optional[Path]:
+    """Return a Path for the config file, honouring global --config fallback."""
+    path = config_file or _state["config_file"]
+    return Path(path) if path else None
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # beam run
@@ -76,7 +96,7 @@ def run(
     if identity_file:
         overrides["ssh.identity_file"] = identity_file
 
-    cfg_path = Path(config_file) if config_file else None
+    cfg_path = _resolve_config_path(config_file)
     cfg = load_config(config_path=cfg_path, overrides=overrides)
     repo_root = get_project_root(cfg_path)
 
@@ -131,7 +151,7 @@ def status(
     config_file: Optional[str] = typer.Option(None, "--config", help="Path to beam.yaml"),
 ) -> None:
     """Show all active sessions."""
-    cfg_path = Path(config_file) if config_file else None
+    cfg_path = _resolve_config_path(config_file)
     cfg = load_config(config_path=cfg_path) if live else None
     repo_root = get_project_root(cfg_path)
     logs_dir = repo_root / ".beam" / "logs"
@@ -286,7 +306,7 @@ def offers(
     """List compatible GPU instances available for the given config."""
     log.set_verbosity(verbose=verbose, quiet=quiet)
 
-    cfg_path = Path(config_file) if config_file else None
+    cfg_path = _resolve_config_path(config_file)
     cfg = load_config(config_path=cfg_path)
 
     if provider in ("vast.ai", "vastai"):
@@ -542,7 +562,7 @@ def logs(
 
     if not remote_logs_dir:
         remote_project_dir = sess.get("remote_project_dir", "/workspace")
-        cfg_path = Path(config_file) if config_file else None
+        cfg_path = _resolve_config_path(config_file)
         cfg = load_config(config_path=cfg_path)
         repo_name = cfg.project.name or Path.cwd().name
         remote_logs_dir = f"{remote_project_dir}/logs/{repo_name}"
@@ -574,7 +594,7 @@ def stop(
     from beam import pulse as pulse_mod
 
     sess = _load_session_or_exit(session_id, config_file)
-    cfg_path = Path(config_file) if config_file else None
+    cfg_path = _resolve_config_path(config_file)
     repo_root = get_project_root(cfg_path)
     logs_dir = repo_root / ".beam" / "logs"
 
@@ -591,7 +611,7 @@ def pulse_list(
     config_file: Optional[str] = typer.Option(None, "--config"),
 ) -> None:
     """List all tracked sessions and their cron status."""
-    cfg_path = Path(config_file) if config_file else None
+    cfg_path = _resolve_config_path(config_file)
     repo_root = get_project_root(cfg_path)
     logs_dir = repo_root / ".beam" / "logs"
 
@@ -640,7 +660,7 @@ def pulse_install(
     """Install a pulse cron job for a session."""
     from beam import pulse as pulse_mod
 
-    cfg_path = Path(config_file) if config_file else None
+    cfg_path = _resolve_config_path(config_file)
     repo_root = get_project_root(cfg_path)
     logs_dir = repo_root / ".beam" / "logs"
 
@@ -674,7 +694,7 @@ def pulse_uninstall(
     """Remove pulse cron job(s)."""
     from beam import pulse as pulse_mod
 
-    cfg_path = Path(config_file) if config_file else None
+    cfg_path = _resolve_config_path(config_file)
     repo_root = get_project_root(cfg_path)
     logs_dir = repo_root / ".beam" / "logs"
 
@@ -703,7 +723,7 @@ def pulse_check(
     """Run a single health check for a session."""
     from beam import pulse as pulse_mod
 
-    cfg_path = Path(config_file) if config_file else None
+    cfg_path = _resolve_config_path(config_file)
     cfg = load_config(config_path=cfg_path)
     repo_root = get_project_root(cfg_path)
     logs_dir = repo_root / ".beam" / "logs"
@@ -741,7 +761,7 @@ def pulse_check(
 
 def _load_session_or_exit(session_id: str, config_file: str | None) -> dict:
     from beam import session as sess_mod
-    cfg_path = Path(config_file) if config_file else None
+    cfg_path = _resolve_config_path(config_file)
     repo_root = get_project_root(cfg_path)
     logs_dir = repo_root / ".beam" / "logs"
     try:
