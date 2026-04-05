@@ -23,3 +23,8 @@ beam = "beam.cli:app"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/beam"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+]
