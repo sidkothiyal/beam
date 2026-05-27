@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 from beam import log
-from beam.config import CredentialsConfig
+from beam.config import CredentialsConfig, CRED_ENV_MAP
 from beam.ssh import SSHClient
 
 
@@ -18,25 +17,36 @@ def setup_creds(
     """Setup credentials on the remote machine."""
     log.step("Setting up credentials on remote ...")
 
-    # -- Kaggle ----------------------------------------------------------------
-    local_kaggle = Path(creds_cfg.kaggle).expanduser()
-    if local_kaggle.is_file():
-        log.info(f"  Copying Kaggle credentials to {remote_home}/.kaggle/ ...")
-        client.run(f"mkdir -p '{remote_home}/.kaggle'")
-        data = local_kaggle.read_text()
+    # -- Credential files ------------------------------------------------------
+    for cf in creds_cfg.credential_files:
+        local_path = Path(cf.local).expanduser()
+        if not local_path.is_file():
+            log.warn(f"  Credential file not found locally: {cf.local} -- skipping.")
+            continue
+        remote_path = (
+            cf.remote if cf.remote.startswith("/")
+            else f"{remote_home}/{cf.remote}"
+        )
+        remote_dir = str(Path(remote_path).parent)
+        log.info(f"  Syncing {cf.local} → {remote_path} ...")
+        client.run(f"mkdir -p '{remote_dir}'")
+        data = local_path.read_text()
         client.upload_stdin(
             data,
-            f"cat > '{remote_home}/.kaggle/kaggle.json' && chmod 600 '{remote_home}/.kaggle/kaggle.json'",
+            f"cat > '{remote_path}' && chmod {cf.chmod} '{remote_path}'",
         )
-        log.done("Kaggle credentials copied.")
-    else:
-        log.warn("  No local Kaggle credentials found -- skipping.")
+        log.done(f"  {local_path.name} synced.")
 
     # -- Environment-variable credentials --------------------------------------
-    for var_name in creds_cfg.env_vars:
-        value = os.environ.get(var_name, "")
+    # Collect env vars: always include the named credential fields that map to
+    # env var names, then add any extra vars listed in env_vars.
+    named_env_vars = list(CRED_ENV_MAP.values())
+    extra_env_vars = [v for v in creds_cfg.env_vars if v not in named_env_vars]
+    all_env_vars = named_env_vars + extra_env_vars
+
+    for var_name in all_env_vars:
+        value = creds_cfg.get_env_value(var_name)
         if not value:
-            log.warn(f"  {var_name} not set locally -- skipping.")
             continue
         log.info(f"  Setting {var_name} in {remote_home}/.bashrc ...")
         script = (
@@ -47,7 +57,7 @@ def setup_creds(
             f"fi"
         )
         client.run(f"bash -c {_sq(script)}")
-        log.done(f"{var_name} set.")
+        log.done(f"  {var_name} set.")
 
 
 def _sq(s: str) -> str:

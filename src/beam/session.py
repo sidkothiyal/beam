@@ -6,7 +6,10 @@ import json
 import os
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from beam.config import CredentialsConfig
 
 
 def _sessions_dir(logs_dir: Path) -> Path:
@@ -42,9 +45,12 @@ def save_session(
     repo_root: str = "",
     name: str = "",
     machine_config: dict[str, Any] | None = None,
+    credentials: "CredentialsConfig | None" = None,
     extra: dict[str, Any] | None = None,
 ) -> Path:
     """Persist session state to a JSON file. Returns the file path."""
+    creds = credentials
+
     data: dict[str, Any] = {
         "session_id": session_id,
         "provider": provider,
@@ -66,12 +72,15 @@ def save_session(
         "repo_root": repo_root,
         "name": name,
         "created_at": datetime.now(timezone.utc).isoformat(),
-        # Preserve API keys for pulse auto-restart (same as shell version)
-        "runpod_api_key": os.environ.get("RUNPOD_API_KEY", ""),
-        "vast_api_key": os.environ.get("VAST_API_KEY", ""),
-        "wandb_api_key": os.environ.get("WANDB_API_KEY", ""),
-        "hf_token": os.environ.get("HUGGING_FACE_HUB_TOKEN", ""),
-        "github_username": os.environ.get("GITHUB_USERNAME", ""),
+        # -- Launch credentials (flat keys, read by pulse provider/restart calls) --
+        "runpod_api_key": creds.get_env_value("RUNPOD_API_KEY") if creds else os.environ.get("RUNPOD_API_KEY", ""),
+        "vast_api_key": creds.get_env_value("VAST_API_KEY") if creds else os.environ.get("VAST_API_KEY", ""),
+        "github_username": creds.get_env_value("GITHUB_USERNAME") if creds else os.environ.get("GITHUB_USERNAME", ""),
+        "docker_ghcr_token": creds.get_env_value("DOCKER_GHRC_TOKEN") if creds else os.environ.get("DOCKER_GHRC_TOKEN", ""),
+        # -- Remote env vars snapshot (restored by pulse before auto-restart) --
+        "env_vars": creds.resolved_env_vars() if creds else {},
+        # -- Credential files snapshot (for pulse to re-sync on restart) --
+        "credential_files": [cf.model_dump() for cf in creds.credential_files] if creds else [],
     }
     # Snapshot the machine config used to create the instance so that
     # pulse auto-restart can recreate without depending on beam.yaml.

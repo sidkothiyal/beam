@@ -105,11 +105,12 @@ def ensure_machine(
 # ---------------------------------------------------------------------------
 
 
-def _get_provider(name: str) -> ProviderBase:
+def _get_provider(name: str, cfg: BeamConfig | None = None) -> ProviderBase:
+    creds = cfg.credentials if cfg else None
     if name == "runpod":
-        return RunPodProvider()
+        return RunPodProvider(api_key=creds.runpod_api_key if creds else None)
     if name in ("vast.ai", "vastai"):
-        return VastAIProvider()
+        return VastAIProvider(api_key=creds.vast_api_key if creds else None)
     raise RuntimeError(f"Unknown provider: {name} (supported: runpod, vast.ai)")
 
 
@@ -169,7 +170,7 @@ def _recover_via_provider(
     ghcr_image: str,
 ) -> MachineResult:
     """Try to restart or recreate via provider after unreachable."""
-    provider = _get_provider(provider_name)
+    provider = _get_provider(provider_name, cfg)
     policy = _get_recovery_policy(cfg, provider_name, pod_config_name)
 
     if policy == "new":
@@ -210,7 +211,7 @@ def _create_via_provider(
     ghcr_image: str,
 ) -> MachineResult:
     """Create or start a machine via the provider, with fallback configs."""
-    provider = _get_provider(provider_name)
+    provider = _get_provider(provider_name, cfg)
     policy = ""
 
     # If there's an existing pod and policy != "new", try starting it

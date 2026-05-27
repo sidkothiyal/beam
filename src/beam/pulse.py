@@ -17,6 +17,7 @@ from beam.config import (
     PulseConfig,
     RunPodMachineConfig,
     VastAIMachineConfig,
+    find_config_file,
     load_config,
 )
 from beam.ssh import SSHClient, SSHInfo
@@ -350,18 +351,37 @@ def _make_ssh_client(sess: dict[str, Any], cfg: BeamConfig | None = None) -> SSH
 # Auto-restart
 # ---------------------------------------------------------------------------
 
+def _load_session_config(sess: dict[str, Any]) -> BeamConfig:
+    """Load beam.yaml using the session's repo_root, not cron's cwd.
+
+    Pulse runs from cron, whose cwd is typically $HOME, so a bare
+    ``load_config()`` would miss the project's beam.yaml and silently fall
+    back to defaults — losing fields like ``credential_files``.
+    """
+    repo_root = sess.get("repo_root", "")
+    if repo_root:
+        cfg_path = find_config_file(Path(repo_root))
+        if cfg_path:
+            return load_config(config_path=cfg_path)
+    return load_config()
+
+
 def _restore_env(sess: dict[str, Any]) -> None:
     """Restore environment variables from session metadata for restarts."""
+    # Restore flat launch credentials (read directly by provider clients)
     for key, env_var in [
         ("runpod_api_key", "RUNPOD_API_KEY"),
         ("vast_api_key", "VAST_API_KEY"),
-        ("wandb_api_key", "WANDB_API_KEY"),
-        ("hf_token", "HUGGING_FACE_HUB_TOKEN"),
         ("github_username", "GITHUB_USERNAME"),
+        ("docker_ghcr_token", "DOCKER_GHRC_TOKEN"),
     ]:
         val = sess.get(key, "")
         if val:
             os.environ[env_var] = val
+    # Restore all remote-forwarded env vars from the snapshot dict
+    for var_name, value in sess.get("env_vars", {}).items():
+        if value:
+            os.environ[var_name] = value
 
 
 def _extract_name(sess: dict[str, Any]) -> str:
@@ -387,7 +407,7 @@ def do_auto_restart(sess: dict[str, Any], logs_dir: Path) -> bool:
 
     provider = sess.get("provider", "")
     pod_config_name = sess.get("pod_config_name", "")
-    cfg = load_config()
+    cfg = _load_session_config(sess)
 
     # If the session has a saved machine_config snapshot, inject it into
     # the loaded config so the restart uses the exact same spec — even if
@@ -506,7 +526,7 @@ def do_soft_restart(sess: dict[str, Any], logs_dir: Path, cfg: BeamConfig | None
     log.warn("Soft restart -- re-syncing code and re-launching on existing machine ...")
 
     try:
-        beam_cfg = cfg or load_config()
+        beam_cfg = cfg or _load_session_config(sess)
         client = _make_ssh_client(sess, beam_cfg)
         if not client.check():
             log.warn("Soft restart: SSH unreachable -- falling back to hard restart")
@@ -546,6 +566,7 @@ def do_soft_restart(sess: dict[str, Any], logs_dir: Path, cfg: BeamConfig | None
             remote_home=remote_home,
             name=_extract_name(sess),
             reuse_session_name=current_session_id,
+            env_vars=sess.get("env_vars", {}),
         )
         if result:
             # Update state dir (may have changed if migrating from shared to per-session)
@@ -687,7 +708,7 @@ def run_check(
     sess = session.load_session(logs_dir, session_id)
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     pcfg = pulse_cfg or PulseConfig()
-    cfg = load_config()
+    cfg = _load_session_config(sess)
 
 
     # Failure tracking

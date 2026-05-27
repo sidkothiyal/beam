@@ -71,7 +71,7 @@ class RunContext:
         self.logs_dir.mkdir(parents=True, exist_ok=True)
 
         # Registry image
-        github_user = os.environ.get("GITHUB_USERNAME", "")
+        github_user = cfg.credentials.github_username
         if github_user:
             self.ghcr_image = (
                 f"ghcr.io/{github_user}/"
@@ -204,6 +204,7 @@ def run_remote(ctx: RunContext) -> None:
         remote_logs_dir=ctx.remote_logs_dir,
         remote_home=cfg.remote.home,
         name=ctx.name,
+        env_vars=cfg.credentials.resolved_env_vars(),
     )
     remote_state_dir = ""
     if result:
@@ -234,6 +235,7 @@ def run_remote(ctx: RunContext) -> None:
         repo_root=str(ctx.repo_root),
         name=ctx.name,
         machine_config=machine_cfg_dict,
+        credentials=cfg.credentials,
         extra={"dph_total": machine.dph_total} if machine.dph_total else None,
     )
 

@@ -27,10 +27,33 @@ ssh:
   retry_interval: 10
 
 credentials:
-  kaggle: ~/.kaggle/kaggle.json
+  # All credentials are optional. Set values here or via env vars
+  # (env always takes priority over yaml values).
+  #
+  # -- Provider API keys -------------------------------------------------------
+  #   runpod_api_key: ""         # env: RUNPOD_API_KEY
+  #   vast_api_key: ""           # env: VAST_API_KEY
+  #
+  # -- Registry / GitHub -------------------------------------------------------
+  #   github_username: ""        # env: GITHUB_USERNAME
+  #   docker_ghcr_token: ""      # env: DOCKER_GHRC_TOKEN
+  #
+  # -- Env vars forwarded to remote ~/.bashrc ----------------------------------
+  # Named credentials above are forwarded automatically. Listed here for
+  # explicitness; add any additional arbitrary env vars as needed.
   env_vars:
     - WANDB_API_KEY
     - HUGGING_FACE_HUB_TOKEN
+    - GITHUB_USERNAME
+    - RUNPOD_API_KEY
+    - VAST_API_KEY
+    - DOCKER_GHRC_TOKEN
+
+  # -- Credential files synced to remote (path relative to remote_home) --------
+  credential_files:
+    - local: ~/.kaggle/kaggle.json
+      remote: .kaggle/kaggle.json
+      chmod: "600"
 
 providers:
   runpod:

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import subprocess
 
 from beam import log
@@ -11,8 +10,8 @@ from beam.config import BeamConfig
 
 def push_image(cfg: BeamConfig, ghcr_image: str) -> None:
     """Tag and push the local Docker image to ghcr.io."""
-    github_username = os.environ.get("GITHUB_USERNAME", "")
-    token = os.environ.get("DOCKER_GHRC_TOKEN") or os.environ.get("GITHUB_TOKEN", "")
+    github_username = cfg.credentials.github_username
+    token = cfg.credentials.docker_ghcr_token
 
     if not github_username:
         raise RuntimeError("GITHUB_USERNAME is not set. Required to push to ghcr.io.")

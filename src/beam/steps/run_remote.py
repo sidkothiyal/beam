@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import time
 
 from beam import log
@@ -24,12 +23,15 @@ def run_remote(
     remote_home: str,
     name: str = "",
     reuse_session_name: str = "",
+    env_vars: dict[str, str] | None = None,
 ) -> RemoteSession | None:
     """Write a run script on the remote and start it in tmux.
 
     Returns a *RemoteSession* with the tmux session name, or None if no
     command was provided.  Pass *reuse_session_name* to keep the same
     session identity (used by soft restart).
+    *env_vars* is a dict of environment variables to export inside the
+    remote run script (e.g. WANDB_API_KEY, HUGGING_FACE_HUB_TOKEN, ...).
     """
     if not command:
         log.done("Setup complete -- no command provided, skipping execution.")
@@ -45,12 +47,9 @@ def run_remote(
     # Escape single quotes for embedding in the remote script
     remote_cmd = command.replace("'", "'\\''")
 
-    wandb_export = ""
-    if os.environ.get("WANDB_API_KEY"):
-        wandb_export = f"export WANDB_API_KEY={os.environ['WANDB_API_KEY']}"
-    hf_export = ""
-    if os.environ.get("HUGGING_FACE_HUB_TOKEN"):
-        hf_export = f"export HUGGING_FACE_HUB_TOKEN={os.environ['HUGGING_FACE_HUB_TOKEN']}"
+    env_exports = "\n".join(
+        f"export {k}={v}" for k, v in (env_vars or {}).items() if v
+    )
 
     log.step(f"Starting tmux session {session_name} on remote ...")
 
@@ -67,8 +66,7 @@ cat > '{remote_code_dir}/.run_session.sh' <<'INNER_EOF'
 export PATH="{remote_home}/.local/bin:$PATH"
 export HOME="{remote_home}"
 export UV_LINK_MODE=copy
-{wandb_export}
-{hf_export}
+{env_exports}
 cd '{remote_code_dir}'
 
 # Expose Python headers for torch.compile / triton

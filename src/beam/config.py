@@ -11,6 +11,23 @@ from pydantic import BaseModel, Field
 
 
 # ---------------------------------------------------------------------------
+# Credential → env-var name mapping (used in resolution and setup_creds)
+# ---------------------------------------------------------------------------
+
+# Maps CredentialsConfig field name → canonical env var name.
+# Only launch credentials (needed locally to provision machines / push images).
+CRED_ENV_MAP: dict[str, str] = {
+    "runpod_api_key": "RUNPOD_API_KEY",
+    "vast_api_key": "VAST_API_KEY",
+    "github_username": "GITHUB_USERNAME",
+    "docker_ghcr_token": "DOCKER_GHRC_TOKEN",
+}
+
+# Reverse mapping: env var name → field name
+_ENV_TO_CRED_FIELD: dict[str, str] = {v: k for k, v in CRED_ENV_MAP.items()}
+
+
+# ---------------------------------------------------------------------------
 # Pydantic config models
 # ---------------------------------------------------------------------------
 
@@ -39,11 +56,51 @@ class SSHConfig(BaseModel):
     identity_file: str = ""
 
 
+class CredentialFile(BaseModel):
+    """A local file to sync to the remote machine."""
+    local: str          # local path (supports ~)
+    remote: str         # path relative to remote_home (e.g. ".kaggle/kaggle.json")
+    chmod: str = "600"  # permissions to set after upload
+
+
 class CredentialsConfig(BaseModel):
-    kaggle: str = "~/.kaggle/kaggle.json"
-    env_vars: list[str] = Field(
-        default_factory=lambda: ["WANDB_API_KEY", "HUGGING_FACE_HUB_TOKEN"]
-    )
+    # -- Launch credentials (needed locally; set in beam.yaml or via env vars) --
+    # Used to provision cloud machines and push Docker images.
+    # Env vars always take priority over yaml values.
+    runpod_api_key: str = ""
+    vast_api_key: str = ""
+    github_username: str = ""
+    docker_ghcr_token: str = ""
+
+    # -- Env vars to forward to the remote machine's ~/.bashrc --
+    # Launch credentials above are forwarded automatically.
+    # Put remote-only tokens here (WANDB_API_KEY, HUGGING_FACE_HUB_TOKEN, etc.)
+    # and any other arbitrary env vars to sync.
+    env_vars: list[str] = Field(default_factory=list)
+
+    # -- Credential files to sync to the remote machine --
+    credential_files: list[CredentialFile] = Field(default_factory=list)
+
+    def get_env_value(self, env_var_name: str) -> str:
+        """Return the resolved value for *env_var_name*.
+
+        Checks the named launch credential fields first (already resolved from
+        yaml + env in ``load_config``), then falls back to ``os.environ``.
+        """
+        field = _ENV_TO_CRED_FIELD.get(env_var_name)
+        if field:
+            return getattr(self, field, "") or os.environ.get(env_var_name, "")
+        return os.environ.get(env_var_name, "")
+
+    def resolved_env_vars(self) -> dict[str, str]:
+        """Return a dict of all env vars (from ``env_vars`` list) resolved to
+        their current values. Entries with no value are omitted."""
+        result: dict[str, str] = {}
+        for var in self.env_vars:
+            value = self.get_env_value(var)
+            if value:
+                result[var] = value
+        return result
 
 
 class RunPodMachineConfig(BaseModel):
@@ -175,8 +232,13 @@ def load_config(
 
     cfg = BeamConfig.model_validate(raw)
 
-    # Environment variable overrides (provider API keys are NOT part of the
-    # config model — they are read at runtime by the provider clients).
+    # Resolve named credentials: env vars take priority over yaml values.
+    for field, env_var in CRED_ENV_MAP.items():
+        env_val = os.environ.get(env_var, "")
+        if env_val:
+            setattr(cfg.credentials, field, env_val)
+
+    # Environment variable overrides
     if os.environ.get("BEAM_REMOTE_USER"):
         cfg.remote.user = os.environ["BEAM_REMOTE_USER"]
     if os.environ.get("BEAM_REMOTE_PROJECT_DIR"):
