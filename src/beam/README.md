@@ -223,6 +223,32 @@ wait_seconds = min(60 * (2 ** restart_count), 1800)
 # 0→60s, 1→120s, 2→240s, ..., max 1800s (30 min)
 ```
 
+### Agent Mode (optional)
+
+The deterministic matrix above never reads logs, so it cannot tell a transient
+failure (spot preemption → restart) from a deterministic one (code bug, NaN
+loss, full disk → stop). Set `pulse.agent.enabled: true` in `beam.yaml` to route
+failed/crashed/outbid/down states through an **LLM tool-calling agent** that
+reads logs, history, disk, GPU, and wandb metrics, then decides — and stops
+crash-loops instead of restarting forever. Off by default; falls back to the
+deterministic matrix whenever the LLM is unavailable. See
+[`agent/README.md`](./agent/README.md).
+
+```bash
+beam pulse agent set-key --provider nim   # store the LLM key (keyring / ~/.beam/agent.env)
+beam pulse agent test                     # verify the backend
+beam pulse agent diagnose --session <id>  # one-shot diagnosis, no action
+```
+
+The agent is further informed by two project-level inputs:
+
+- **`BEAM_AGENT.md`** (committed, repo root) — operator knowledge fed to the agent
+  every check; it also records durable learnings into its own marker-delimited
+  section after a successful check (`pulse.agent.project_doc`).
+- **Unified per-job log** — `.beam/logs/sessions/<id>.log` captures every `beam run`
+  step **and** every `beam pulse` check for the job in one timeline (`log.py`'s
+  `attach_job_log`), which the agent reads via `read_job_log`.
+
 ---
 
 ## `session.py` — Session State

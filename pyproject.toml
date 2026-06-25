@@ -18,8 +18,26 @@ dependencies = [
     "rich>=13.0",
 ]
 
+[project.optional-dependencies]
+# Pulse agent mode (LLM tool-calling diagnosis). Kept optional so the base
+# install stays lean; all three are imported lazily and degrade gracefully.
+agent = [
+    "litellm>=1.40",
+    "keyring>=24",
+    "wandb>=0.16",
+]
+test = [
+    "pytest>=8.0",
+]
+
 [project.scripts]
 beam = "beam.cli:app"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "live: end-to-end tests that call the real NVIDIA NIM API (needs NVIDIA_API_KEY)",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/beam"]

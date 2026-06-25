@@ -30,6 +30,9 @@ app = typer.Typer(
 pulse_app = typer.Typer(help="Pulse monitoring and cron management.")
 app.add_typer(pulse_app, name="pulse")
 
+pulse_agent_app = typer.Typer(help="Pulse agent-mode (LLM diagnosis) controls.")
+pulse_app.add_typer(pulse_agent_app, name="agent")
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # beam run
@@ -102,7 +105,27 @@ def run(
     if not ip and not provider:
         run_local(ctx)
     else:
-        pipeline_remote(ctx)
+        # Mirror all run output to a per-job log file. The session id is minted
+        # late (inside run_remote), so start on a temp path and rename once known
+        # — yielding one unified timeline that pulse will keep appending to.
+        sessions_dir = ctx.logs_dir / "sessions"
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+        tmp_log = sessions_dir / f".run-{os.getpid()}.log"
+        log.attach_job_log(tmp_log)
+        try:
+            pipeline_remote(ctx)
+        finally:
+            log.detach_job_log()
+            if ctx.session_name:
+                final_log = sessions_dir / f"{ctx.session_name}.log"
+                if final_log.exists():
+                    with open(final_log, "a", encoding="utf-8") as dst:
+                        dst.write(tmp_log.read_text(encoding="utf-8"))
+                    tmp_log.unlink(missing_ok=True)
+                else:
+                    tmp_log.rename(final_log)
+            else:
+                tmp_log.unlink(missing_ok=True)
 
         # Install pulse cron if requested
         if pulse_interval and cmd_str:
@@ -733,6 +756,120 @@ def pulse_check(
         max_retries=max_retries,
         pulse_cfg=cfg.pulse,
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# beam pulse agent — set-key / test / diagnose
+# ═══════════════════════════════════════════════════════════════════════════
+
+@pulse_agent_app.command("set-key")
+def pulse_agent_set_key(
+    provider: str = typer.Option("nim", "--provider", help="LLM provider: nim, openrouter, openai"),
+    config_file: Optional[str] = typer.Option(None, "--config"),
+) -> None:
+    """Store the agent LLM API key (OS keyring if available, else ~/.beam/agent.env)."""
+    from beam.agent import secrets
+
+    cfg_path = Path(config_file) if config_file else None
+    cfg = load_config(config_path=cfg_path)
+    # Honor a custom api_key_env if the configured provider matches; else default.
+    agent_llm = cfg.pulse.agent.llm
+    env_name = (
+        agent_llm.api_key_env
+        if agent_llm.provider == provider and agent_llm.api_key_env
+        else secrets.provider_env_name(provider)
+    )
+    value = typer.prompt(f"{provider} API key ({env_name})", hide_input=True)
+    backend = secrets.set_secret(env_name, value)
+    log.done(f"Stored {provider} key ({env_name}) via {backend}.")
+
+
+@pulse_agent_app.command("test")
+def pulse_agent_test(
+    config_file: Optional[str] = typer.Option(None, "--config"),
+) -> None:
+    """Make one live LLM call (and one tool round-trip) to verify the agent backend."""
+    import time as _time
+
+    from beam.agent.llm import AgentLLM, LLMUnavailable
+
+    cfg_path = Path(config_file) if config_file else None
+    cfg = load_config(config_path=cfg_path)
+    agent_cfg = cfg.pulse.agent
+
+    llm = AgentLLM(agent_cfg.llm)
+    log.kv("provider", llm.provider)
+    log.kv("model", llm.model_name)
+    log.kv("base_url", llm.base_url or "(default)")
+    log.kv("api_key_env", agent_cfg.llm.api_key_env)
+    log.kv("key_found", "yes" if llm.available() else "NO")
+    if not llm.available():
+        log.error("No API key resolved. Run: beam pulse agent set-key --provider " + llm.provider)
+        raise typer.Exit(1)
+
+    try:
+        t0 = _time.time()
+        reply = llm.complete("You are a health check.", "Reply with the single word OK.")
+        log.done(f"LLM round-trip OK in {_time.time() - t0:.1f}s -- reply: {reply.strip()[:60]}")
+    except LLMUnavailable as exc:
+        log.error(f"LLM unavailable: {exc}")
+        raise typer.Exit(1)
+    except Exception as exc:  # noqa: BLE001
+        log.error(f"LLM call failed: {exc}")
+        raise typer.Exit(1)
+
+
+@pulse_agent_app.command("diagnose")
+def pulse_agent_diagnose(
+    session_id: str = typer.Option(
+        ..., "--session", help="Session ID",
+        autocompletion=complete.complete_session_id,
+    ),
+    config_file: Optional[str] = typer.Option(None, "--config"),
+) -> None:
+    """Run a one-shot agent diagnosis for a session and print the verdict (no action taken)."""
+    from beam import pulse as pulse_mod
+    from beam.agent.diagnose import diagnose_session
+
+    cfg_path = Path(config_file) if config_file else None
+    cfg = load_config(config_path=cfg_path)
+    repo_root = get_project_root(cfg_path)
+    logs_dir = repo_root / ".beam" / "logs"
+    sess = _load_session_or_exit(session_id, config_file)
+
+    # Gather the same observations run_check would, then diagnose (advisory).
+    instance_status = pulse_mod.check_provider_status(sess)
+    if instance_status in ("unknown", "api_error") and sess.get("ip"):
+        if pulse_mod.check_ssh_reachable(sess, cfg):
+            instance_status = "reachable"
+    job_info = {"state": "unknown"}
+    if instance_status in ("running", "reachable") and sess.get("ip"):
+        job_info = pulse_mod.check_job_state(sess, cfg)
+    job_state = job_info.get("state", "unknown")
+
+    pulse_mod._restore_env(sess)
+    observations = pulse_mod._agent_observations(
+        sess, instance_status, job_state, job_info,
+        consecutive_failures=0, idle_strikes=0, max_retries=cfg.pulse.max_retries,
+    )
+    log.info(f"instance={instance_status} job={job_state}")
+    verdict = diagnose_session(sess, observations, logs_dir, cfg)
+
+    if not verdict.used_agent:
+        log.error(f"Agent unavailable: {verdict.error}")
+        raise typer.Exit(1)
+
+    log.console.print()
+    log.kv("decision", verdict.decision)
+    log.kv("root_cause", verdict.root_cause)
+    log.kv("confidence", f"{verdict.confidence:.2f}")
+    log.kv("tokens", str(verdict.total_tokens))
+    log.console.print(f"  [info]reason:[/info] {verdict.reason}")
+    log.console.print()
+    log.info("Tool trace:")
+    for t in verdict.tool_trace:
+        log.console.print(f"  - {t['tool']}({t.get('args', {})}) -> {t.get('summary', '')[:160]}")
+    log.warn("(diagnose is advisory — no recovery action was taken)")
 
 
 # ═══════════════════════════════════════════════════════════════════════════

@@ -88,6 +88,24 @@ def pulse_uninstall(session_id: str): ...
 def pulse_check(session_id: str): ...  # run_check(session_id)
 ```
 
+### Pulse Agent Sub-Commands (`pulse agent`)
+
+```python
+pulse_agent_app = typer.Typer()
+pulse_app.add_typer(pulse_agent_app, name="agent")
+
+@pulse_agent_app.command("set-key")
+def pulse_agent_set_key(provider: str = "nim"): ...   # secrets.set_secret(env_name, key)
+
+@pulse_agent_app.command("test")
+def pulse_agent_test(): ...                            # one live AgentLLM.complete() round-trip
+
+@pulse_agent_app.command("diagnose")
+def pulse_agent_diagnose(session_id: str): ...         # diagnose_session() -> print verdict, no action
+```
+
+See [`agent/ARCHITECTURE.md`](./agent/ARCHITECTURE.md) for the agent internals.
+
 ---
 
 ## `config.py`
@@ -226,6 +244,40 @@ class PulseConfig(BaseModel):
     idle_threshold_minutes: int = 15
     idle_gpu_threshold: int = 10        # % utilization = idle
     max_restarts: int = 5
+    agent: PulseAgentConfig             # agent-mode config (see below)
+```
+
+### `AgentLLMConfig` / `PulseAgentConfig`
+
+Agent-mode config nested under `pulse.agent`. `enabled=False` (default) keeps
+today's deterministic behavior.
+
+```python
+class AgentLLMConfig(BaseModel):
+    provider: str = "nim"               # nim | openrouter | openai
+    model: str = "qwen/qwen3.5-397b-a17b"
+    base_url: str | None = None
+    api_key_env: str = "NVIDIA_API_KEY"  # names the secret, never the key
+    temperature: float = 0.1
+    max_tokens: int = 4096
+    timeout: int = 90
+    retries: int = 3
+    max_tool_iterations: int = 8
+
+class PulseAgentConfig(BaseModel):
+    enabled: bool = False
+    llm: AgentLLMConfig
+    trigger_on: list[str] = ["failed", "crashed", "outbid", "provider_down"]
+    read_logs: bool = True; log_tail_lines: int = 400; log_max_bytes: int = 65536
+    disk_check: bool = True; history_lookback: int = 50
+    use_wandb: bool = True; wandb_entity: str = ""; wandb_project: str = ""
+    allow_server_switch: bool = True
+    read_job_log: bool = True; job_log_tail_lines: int = 300   # unified per-job log tool
+    project_doc: str = "BEAM_AGENT.md"; project_doc_max_bytes: int = 8192
+    advisory: bool = False              # dry-run: log verdict, take no action
+    max_agent_restarts: int = 8
+    crash_loop_window: int = 3600; crash_loop_threshold: int = 4
+    escalate_command: str = ""          # optional notify hook on escalate
 ```
 
 ### `load_config()`
@@ -268,11 +320,15 @@ def final_banner(msg: str | None = None) -> None
 
 def kv(key: str, value: str) -> None
 # Prints: "  key: value" (indented, key in bold)
+
+# Per-job unified log sink (one timeline for beam run + every beam pulse check):
+def attach_job_log(path: Path | str) -> None   # mirror all emitters to a file (append)
+def detach_job_log() -> None                    # stop mirroring, close handle
 ```
 
 ### Design
 
-Uses `rich.console.Console` with markup. Verbosity is global module-level state set once via `set_verbosity()` at CLI startup.
+Uses `rich.console.Console` with markup. Verbosity is global module-level state set once via `set_verbosity()` at CLI startup. When a job log is attached, every emitter ALSO appends a timestamped line to that file (regardless of quiet/verbose) so the file is a complete record. `cli.run` attaches it for `beam run`; `pulse.run_check` re-attaches `<id>.log` for each check.
 
 ---
 
@@ -485,6 +541,42 @@ Read from `{remote_logs_dir}/.beam_state/`:
 beam pulse check {session_id}
 ```
 
+### Agent Mode (optional)
+
+When `pulse.agent.enabled`, `run_check()` routes "interesting" states to an LLM
+tool-calling agent *before* the deterministic matrix; on any agent failure it
+falls through to the matrix (never less reliable).
+
+```python
+trigger = _classify_trigger(instance_status, job_state)
+# "" (skip) | "failed" | "crashed" | "outbid" | "provider_down"
+if agent_cfg.enabled and auto_restart and trigger in agent_cfg.trigger_on:
+    verdict = beam.agent.diagnose.diagnose_session(sess, observations, logs_dir, cfg)
+if verdict and verdict.used_agent:
+    action = _dispatch_agent_decision(verdict, ...)   # maps decision -> do_*
+else:
+    ... deterministic matrix ...
+```
+
+Key functions added to `pulse.py`:
+- `_classify_trigger(instance_status, job_state)` — trigger token or "".
+- `_agent_observations(...)` — cheap context handed to the agent.
+- `_dispatch_agent_decision(...)` — maps the verdict's `decision` to `do_*`,
+  enforcing `max_retries`, `max_agent_restarts` (`.pulse_agent_restarts_<id>`),
+  and the crash-loop guard (`_count_recent_root_cause`).
+- `do_escalate(sess, session_id, logs_dir, verdict, cfg)` — stop + write
+  `pulse_escalation_<id>.txt` + run `escalate_command`. The crash-loop fix.
+
+History records gain `agent_used`, `decision`, `root_cause`, `reason`,
+`confidence`, `tool_calls`, `tokens`, `project_doc_updated` when the agent ran.
+
+`run_check` also attaches the **unified per-job log** (`sess["log_file"]` =
+`.beam/logs/sessions/<id>.log`) so every check + restart appends to the same
+timeline started by `beam run`; and after a *successful* (non-advisory) agent
+dispatch it writes `verdict.project_doc_update` into `BEAM_AGENT.md`'s
+agent-managed section via `beam.agent.project_doc.update_agent_section`. See
+[`agent/ARCHITECTURE.md`](./agent/ARCHITECTURE.md).
+
 ---
 
 ## `session.py`
@@ -638,6 +730,7 @@ The ControlMaster socket is created on first connection and reused for 120 secon
 ## See Also
 
 - **[`README.md`](./README.md)** — Features & usage examples
+- **[`agent/ARCHITECTURE.md`](./agent/ARCHITECTURE.md)** — Pulse agent-mode internals
 - **[`providers/ARCHITECTURE.md`](./providers/ARCHITECTURE.md)** — Provider implementation details
 - **[`steps/ARCHITECTURE.md`](./steps/ARCHITECTURE.md)** — Step implementation details
 

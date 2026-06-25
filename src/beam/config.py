@@ -169,6 +169,71 @@ class ProvidersConfig(BaseModel):
     vastai: VastAIProviderConfig = Field(default_factory=VastAIProviderConfig)
 
 
+class AgentLLMConfig(BaseModel):
+    """LLM backend for pulse agent mode (litellm OpenAI-compatible gateway)."""
+    provider: str = "nim"                        # nim | openrouter | openai
+    model: str = "qwen/qwen3.5-397b-a17b"        # NIM default
+    base_url: str | None = None                  # else PROVIDER_BASE[provider]
+    # Names the env var / secret holding the API key — never the key itself
+    # (beam.yaml is committed). Resolved via the 3-tier secret resolver
+    # (env -> ~/.beam/agent.env -> keyring) at check time.
+    api_key_env: str = "NVIDIA_API_KEY"
+    temperature: float = 0.1
+    max_tokens: int = 4096
+    timeout: int = 90                            # per-call ceiling (seconds)
+    retries: int = 3                             # litellm num_retries
+    max_tool_iterations: int = 8                 # tool-calling loop cap
+
+
+class PulseAgentConfig(BaseModel):
+    """Agentic diagnosis layer over the deterministic pulse decision matrix.
+
+    When ``enabled`` is False (default), pulse behaves exactly as before. When
+    enabled, "interesting" health states are routed to an LLM tool-calling loop
+    that investigates (reads logs/history/metrics) and emits a recovery
+    decision mapped onto the existing ``do_*`` actions. Always degrades to the
+    deterministic matrix on any LLM failure.
+    """
+    enabled: bool = False                        # master switch
+
+    llm: AgentLLMConfig = Field(default_factory=AgentLLMConfig)
+
+    # -- Gating: which deterministic observations invoke the agent. --
+    # Healthy 'running' is excluded to save cost/latency; GPU-idle handling
+    # remains deterministic in v1 (the existing strikes mechanism is well-tuned).
+    trigger_on: list[str] = Field(default_factory=lambda: [
+        "failed", "crashed", "outbid", "provider_down",
+    ])
+
+    # -- Tool toggles --
+    read_logs: bool = True
+    log_tail_lines: int = 400
+    log_max_bytes: int = 65536
+    disk_check: bool = True
+    history_lookback: int = 50
+    read_job_log: bool = True             # expose the unified per-job run+pulse log
+    job_log_tail_lines: int = 300
+
+    # -- Canonical per-project doc (operator knowledge fed to the agent) --
+    # Path relative to the repo root; "" disables. Human content is preserved;
+    # the agent only maintains its own marker-delimited section.
+    project_doc: str = "BEAM_AGENT.md"
+    project_doc_max_bytes: int = 8192
+
+    use_wandb: bool = True
+    wandb_entity: str = ""
+    wandb_project: str = ""
+
+    allow_server_switch: bool = True
+
+    # -- Safety --
+    advisory: bool = False                       # dry-run: log verdict, take no action
+    max_agent_restarts: int = 8                  # agent-driven restart cap per session
+    crash_loop_window: int = 3600               # seconds to scan for repeated root_cause
+    crash_loop_threshold: int = 4               # same root_cause N times -> escalate
+    escalate_command: str = ""                  # optional shell hook on escalate
+
+
 class PulseConfig(BaseModel):
     gpu_idle_threshold: int = 5
     gpu_idle_max_strikes: int = 3
@@ -176,6 +241,7 @@ class PulseConfig(BaseModel):
     gpu_idle_sample_interval: int = 2
     max_retries: int = 5
     auto_stop_on_complete: bool = True
+    agent: PulseAgentConfig = Field(default_factory=PulseAgentConfig)
 
 
 class BeamConfig(BaseModel):

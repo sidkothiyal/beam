@@ -33,6 +33,12 @@ Single state dataclass passed through all pipeline steps. Steps mutate it to car
 ### Sentinel Files
 Remote job state tracked via files (`RUNNING`/`FINISHED`/`FAILED`) in `.beam_state/`. Pulse reads these for health checks.
 
+### Unified Per-Job Log
+`log.py`'s `attach_job_log`/`detach_job_log` mirror all output to `.beam/logs/sessions/<id>.log`. `beam run` and every `beam pulse check` (incl. restarts) append to the same file — one timeline the pulse agent reads via the `read_job_log` tool.
+
+### Project Doc (`BEAM_AGENT.md`)
+Committed, human-editable operator knowledge fed to the pulse agent every check (`pulse.agent.project_doc`). The agent maintains only its own marker-delimited section (`beam.agent.project_doc.update_agent_section`), written after a successful check; human content is never overwritten.
+
 ### Provider Status Normalisation
 All providers must map native statuses to: `running`, `stopped`, `exited`, `unknown`, `error`, `api_error`.
 
@@ -43,6 +49,8 @@ All providers must map native statuses to: `running`, `stopped`, `exited`, `unkn
 | New CLI flag | `cli.py` + `config.py` |
 | New pipeline step | `steps/<name>.py` + register in `pipeline.py` |
 | New provider | `providers/<name>.py` (impl `ProviderBase`) + `cli.py` + `pipeline.py` + `config.py` |
+| New pulse agent tool | `agent/tools.py` (fn + schema + register in `dispatch`) |
+| New pulse agent LLM backend | `agent/llm.py` (`PROVIDER_BASE`) + `agent/secrets.py` (`PROVIDER_ENV`) |
 
 ## Documentation
 
