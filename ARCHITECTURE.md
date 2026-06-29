@@ -6,7 +6,7 @@
 
 ## What It Is
 
-Beam is a CLI tool that provisions cloud GPU instances (RunPod, Vast.ai), builds and transfers Python virtual environments, syncs code via rsync, sets up credentials, and launches training jobs in tmux sessions. A Pulse subsystem provides cron-based health monitoring with auto-restart, GPU idle detection, and cost tracking. The codebase is organized as a Typer CLI over a 7-step pipeline, with Pydantic v2 config, provider abstractions, and per-step modules.
+Beam is a CLI tool that provisions cloud GPU instances (RunPod, Vast.ai), builds and transfers Python virtual environments, syncs code via rsync, sets up credentials, and launches training jobs in tmux sessions. A Pulse subsystem provides cron-based health monitoring with auto-restart, GPU idle detection, and cost tracking — and, optionally, an **LLM agent mode** that reads logs and metrics to diagnose failures (transient vs. deterministic) and stop crash-loops. The codebase is organized as a Typer CLI over a 7-step pipeline, with Pydantic v2 config, provider abstractions, per-step modules, and an optional `agent/` package.
 
 ---
 
@@ -39,6 +39,13 @@ beam/
     │   ├── base.py             # ProviderBase ABC (7-method interface)
     │   ├── runpod.py           # RunPod REST API client
     │   └── vastai.py           # Vast.ai REST API client + 5 bid strategies
+    ├── agent/                  # Pulse agent mode: LLM tool-calling diagnosis (optional [agent] extra)
+    │   ├── secrets.py          # 3-tier API-key resolver (env / ~/.beam/agent.env / keyring)
+    │   ├── llm.py              # litellm gateway (NIM/OpenRouter/OpenAI) + tool-calling loop
+    │   ├── prompts.py          # System prompt + observation formatter (+ project doc)
+    │   ├── tools.py            # Diagnosis tools (logs, job-log, history, disk, GPU, wandb, offers)
+    │   ├── project_doc.py      # Canonical BEAM_AGENT.md: read + marker-spliced agent section
+    │   └── diagnose.py         # Orchestrator -> AgentVerdict (graceful fallback)
     └── steps/
         ├── __init__.py
         ├── build_venv.py       # Build Python venv in Docker, MD5-hash dep files
@@ -76,9 +83,14 @@ Orchestrates the 7-step deploy pipeline. `RunContext` is the central state objec
 **Edit when:** Changing pipeline ordering, adding a new step to the pipeline, modifying RunContext fields or derived paths.
 
 ### `pulse.py`
-Cron-based health monitoring subsystem. Installs/uninstalls cron jobs, runs health checks (`run_check()`), reads sentinel files from remote, implements the decision matrix, and executes restart strategies. Manages backoff files, idle-strike counters, and the JSONL audit log.
+Cron-based health monitoring subsystem. Installs/uninstalls cron jobs, runs health checks (`run_check()`), reads sentinel files from remote, implements the decision matrix, and executes restart strategies. Manages backoff files, idle-strike counters, and the JSONL audit log. When `pulse.agent.enabled`, `run_check()` routes failure states through the agent (`_classify_trigger` → `diagnose_session` → `_dispatch_agent_decision`) before the deterministic matrix, with `do_escalate` for crash-loops.
 
-**Edit when:** Changing health-check logic, adding restart strategies, modifying backoff behavior, changing GPU idle detection.
+**Edit when:** Changing health-check logic, adding restart strategies, modifying backoff behavior, changing GPU idle detection, or changing how the agent verdict maps to actions/caps.
+
+### `agent/` (optional)
+Pulse agent mode — an LLM tool-calling loop that diagnoses *why* a job is unhealthy (reads logs, recovery history, disk, GPU, wandb metrics, provider offers) and emits a recovery decision mapped onto pulse's `do_*` actions. Backends (NIM default / OpenRouter / OpenAI) go through one litellm gateway. Degrades to the deterministic matrix on any failure. Gated by the `[agent]` extra and `pulse.agent.enabled`.
+
+**Edit when:** Adding a diagnosis tool (`agent/tools.py` — fn + schema + dispatch), changing the system prompt (`agent/prompts.py`), adding an LLM backend (`agent/llm.py`), or changing the decision vocabulary (`agent/tools.py` + `pulse._dispatch_agent_decision`). See [`src/beam/agent/ARCHITECTURE.md`](./src/beam/agent/ARCHITECTURE.md).
 
 ### `session.py`
 Reads and writes JSON session files at `.beam/logs/sessions/{id}.json`. A session captures everything needed to reconnect, restart, or monitor a job: SSH info, provider details, remote paths, API keys, tmux session name.

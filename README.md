@@ -13,7 +13,7 @@
 3. **Syncs** the venv and your code to the remote machine via rsync/SSH
 4. **Sets up** credentials (W&B, HuggingFace, Kaggle) on the remote
 5. **Launches** your training command in a tmux session with sentinel-file tracking
-6. **Monitors** the job via the Pulse subsystem (cron-based health checks, auto-restart, GPU idle detection)
+6. **Monitors** the job via the Pulse subsystem (cron-based health checks, auto-restart, GPU idle detection) — optionally with an **LLM agent** that reads logs/metrics to diagnose failures and stop futile restart loops
 
 ---
 
@@ -24,6 +24,8 @@
 - 🔄 **Smart venv sync** — MD5-hashed deps, incremental transfers, Docker-built envs
 - 📦 **Registry mode** — Push venv as Docker image to ghcr.io for fast deploys
 - 💓 **Pulse monitoring** — Cron-based health checks with auto-restart and GPU idle detection
+- 🤖 **Pulse agent mode** — Optional LLM agent (NVIDIA NIM / OpenRouter / OpenAI) that reads logs, history, disk, GPU & wandb metrics to tell transient failures from real bugs and stop crash-loops (`pulse.agent.enabled`; `beam pulse agent set-key`)
+- 🧠 **Project memory + unified job log** — A committed `BEAM_AGENT.md` feeds operator knowledge to the agent (and it records durable learnings back); one per-job log captures every `beam run` + `beam pulse` step so the agent sees the whole timeline
 - 💸 **Cost tracking** — Log $/hr per session, idle-stop to save money
 - 🎯 **Bid strategies** — 5 strategies for Vast.ai spot instances
 - 🔁 **Recovery** — Reconnect to existing instances, recover from spot preemption

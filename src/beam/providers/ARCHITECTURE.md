@@ -214,6 +214,12 @@ def wait_ready(self, pod_id: str, timeout: int = 300) -> SSHInfo:
 
 ### Offer Resolution
 
+> **Also consumed by Pulse agent mode:** `is_outbid()` and
+> `list_compatible_offers()` are called by the agent toolset
+> (`agent/tools.py`: `get_instance_details`, `list_provider_offers`) to confirm a
+> spot preemption and to surface a better/cheaper machine before a
+> `destroy_restart`. Keep their signatures stable.
+
 ```python
 def list_compatible_offers(self, cfg: VastAIMachineConfig) -> list[dict]:
     # GET /bundles/ with filter params:

@@ -148,3 +148,26 @@ pulse:
   gpu_idle_samples: 5
   gpu_idle_sample_interval: 2
   max_retries: 5
+
+  # -- Agent mode (optional) --------------------------------------------------
+  # When enabled, failure states (failed/crashed/outbid/provider_down) are routed
+  # to an LLM that reads logs/history/metrics to decide recovery, and stops
+  # crash-loops instead of restarting forever. Off by default. Store the API key
+  # with `beam pulse agent set-key --provider nim` (never put it in this file).
+  # Requires the optional extra: uv pip install -e ".[agent]"
+  agent:
+    enabled: false
+    llm:
+      provider: nim                       # nim (default) | openrouter | openai
+      model: qwen/qwen3.5-397b-a17b
+      api_key_env: NVIDIA_API_KEY
+    use_wandb: true
+    wandb_entity: elemental-ai
+    wandb_project: elemental
+    allow_server_switch: true
+    advisory: false                       # true = log recommendations without acting
+    # escalate_command: "curl -X POST https://hooks.slack.com/... -d \"$BEAM_ROOT_CAUSE\""
+    # Canonical project knowledge fed to the agent every check (committed, human-
+    # editable; the agent maintains its own marker-delimited section). "" disables.
+    project_doc: BEAM_AGENT.md
+    read_job_log: true                    # agent can read the unified per-job run+pulse log

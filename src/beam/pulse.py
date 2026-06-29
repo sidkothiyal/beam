@@ -480,6 +480,16 @@ def do_auto_restart(sess: dict[str, Any], logs_dir: Path) -> bool:
                     max_retries=sess.get("max_retries", 5),
                     logs_dir=logs_dir,
                 )
+            # Carry the unified job log forward so the new session continues the
+            # same timeline (provisioning + every prior pulse check + this restart).
+            try:
+                old_log = session.session_path(logs_dir, old_session_id).with_suffix(".log")
+                new_log = session.session_path(logs_dir, new_session_id).with_suffix(".log")
+                if old_log.exists():
+                    existing = new_log.read_text(encoding="utf-8") if new_log.exists() else ""
+                    new_log.write_text(old_log.read_text(encoding="utf-8") + existing, encoding="utf-8")
+            except OSError:
+                pass
             session.delete_session(logs_dir, old_session_id)
 
         log.done("Hard restart complete.")
@@ -668,6 +678,229 @@ def do_idle_stop(sess: dict[str, Any], session_id: str, logs_dir: Path) -> None:
     uninstall_cron(session_id, logs_dir=logs_dir)
 
 
+def do_escalate(sess: dict[str, Any], session_id: str, logs_dir: Path, verdict: Any, cfg: BeamConfig) -> None:
+    """Stop a job the agent judged unrecoverable, and alert a human.
+
+    Reuses ``do_idle_stop`` for teardown (stop instance + remove cron), writes a
+    durable escalation marker, and optionally runs ``pulse.agent.escalate_command``
+    as a notification hook. This is the answer to the crash-loop failure mode:
+    stop the bleed instead of restarting forever.
+    """
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    root_cause = getattr(verdict, "root_cause", "")
+    reason = getattr(verdict, "reason", "")
+    log.error(f"[{now}] ESCALATE — root_cause={root_cause}: {reason}")
+
+    marker = logs_dir / "sessions" / f"pulse_escalation_{session_id}.txt"
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(
+            f"escalated_at: {now}\n"
+            f"session_id: {session_id}\n"
+            f"root_cause: {root_cause}\n"
+            f"confidence: {getattr(verdict, 'confidence', 0.0)}\n"
+            f"reason: {reason}\n"
+        )
+    except Exception:
+        pass
+
+    # Stop the instance and remove the cron job (reuse existing teardown).
+    do_idle_stop(sess, session_id, logs_dir)
+
+    cmd = getattr(cfg.pulse.agent, "escalate_command", "")
+    if cmd:
+        env = {
+            **os.environ,
+            "BEAM_SESSION_ID": session_id,
+            "BEAM_ROOT_CAUSE": root_cause or "",
+            "BEAM_REASON": reason or "",
+        }
+        try:
+            subprocess.run(cmd, shell=True, env=env, timeout=60)
+        except Exception as exc:
+            log.warn(f"escalate_command failed: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Agent mode — trigger classification, observation gathering, dispatch
+# ---------------------------------------------------------------------------
+
+# Decisions that consume the restart budget and re-provision/relaunch.
+_RESTART_DECISIONS = frozenset(
+    {"soft_restart", "hard_restart", "outbid_restart", "destroy_restart"}
+)
+
+
+def _classify_trigger(instance_status: str, job_state: str) -> str:
+    """Map a (instance_status, job_state) pair to an agent trigger token.
+
+    Returns "" for states the agent should not handle (healthy running,
+    finished, transient api_error) so the deterministic matrix runs instead.
+    """
+    if instance_status == "outbid":
+        return "outbid"
+    if instance_status in ("stopped", "exited", "unreachable", "error", "unknown"):
+        return "provider_down"
+    if instance_status in ("running", "reachable"):
+        if job_state in ("failed", "crashed"):
+            return job_state
+    return ""
+
+
+def _agent_observations(
+    sess: dict[str, Any],
+    instance_status: str,
+    job_state: str,
+    job_info: dict[str, Any],
+    *,
+    consecutive_failures: int,
+    idle_strikes: int,
+    max_retries: int,
+) -> dict[str, Any]:
+    mc = sess.get("machine_config") or {}
+    return {
+        "instance_status": instance_status,
+        "job_state": job_state,
+        "exit_code": job_info.get("exit_code"),
+        "consecutive_failures": consecutive_failures,
+        "idle_strikes": idle_strikes,
+        "max_retries": max_retries,
+        "provider": sess.get("provider"),
+        "interruptible": bool(mc.get("spot")) or mc.get("offer_type") == "bid",
+        "offer_type": mc.get("offer_type"),
+        "dph_total": sess.get("dph_total"),
+        "session_name": sess.get("name") or sess.get("session_id"),
+        "ssh_reachable": instance_status in ("running", "reachable"),
+    }
+
+
+def _count_recent_root_cause(
+    logs_dir: Path, session_id: str, root_cause: str, window_secs: int
+) -> int:
+    """Count history records within *window_secs* sharing *root_cause*."""
+    if not root_cause:
+        return 0
+    hist = logs_dir / "sessions" / f"pulse_history_{session_id}.jsonl"
+    if not hist.exists():
+        return 0
+    cutoff = time.time() - window_secs
+    count = 0
+    for line in hist.read_text().splitlines():
+        try:
+            r = _json.loads(line)
+        except ValueError:
+            continue
+        if r.get("root_cause") != root_cause:
+            continue
+        ts = r.get("ts", "")
+        try:
+            t = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S").timestamp()
+        except (ValueError, TypeError):
+            count += 1  # unparseable timestamp — count conservatively
+            continue
+        if t >= cutoff:
+            count += 1
+    return count
+
+
+def _dispatch_agent_decision(
+    verdict: Any,
+    sess: dict[str, Any],
+    session_id: str,
+    logs_dir: Path,
+    cfg: BeamConfig,
+    *,
+    consecutive_failures: int,
+    max_retries: int,
+    failures_file: Path,
+    with_lock,
+) -> str:
+    """Execute the agent's decision, enforcing caps that can override the LLM.
+
+    Returns the action string actually taken (for the history log).
+    """
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    agent_cfg = cfg.pulse.agent
+    decision = verdict.decision
+
+    if agent_cfg.advisory:
+        log.info(
+            f"[{now}] [advisory] agent recommends '{decision}' "
+            f"(root_cause={verdict.root_cause}); taking no action"
+        )
+        return f"advisory:{decision}"
+
+    sessions_dir = logs_dir / "sessions"
+    agent_restarts_file = sessions_dir / f".pulse_agent_restarts_{session_id}"
+    agent_restarts = (
+        int(agent_restarts_file.read_text().strip() or 0)
+        if agent_restarts_file.exists() else 0
+    )
+
+    # ----- Caps that override the agent (enforced in code, not trusted to LLM) -----
+    if decision in _RESTART_DECISIONS:
+        repeats = _count_recent_root_cause(
+            logs_dir, session_id, verdict.root_cause, agent_cfg.crash_loop_window
+        )
+        if verdict.root_cause and repeats >= agent_cfg.crash_loop_threshold:
+            log.warn(
+                f"[{now}] crash-loop guard: root_cause '{verdict.root_cause}' seen "
+                f"{repeats}x within {agent_cfg.crash_loop_window}s -- escalating "
+                f"instead of {decision}"
+            )
+            decision = "escalate"
+        elif agent_restarts >= agent_cfg.max_agent_restarts:
+            log.warn(
+                f"[{now}] agent restart cap reached "
+                f"({agent_restarts}/{agent_cfg.max_agent_restarts}) -- escalating"
+            )
+            decision = "escalate"
+        elif consecutive_failures >= max_retries:
+            log.error(f"[{now}] max_retries ({max_retries}) reached -- giving up")
+            decision = "give_up"
+
+    # ----- Execute -----
+    if decision == "wait":
+        log.info(f"[{now}] agent: wait ({verdict.root_cause}) -- re-check next tick")
+        return "wait"
+
+    if decision in _RESTART_DECISIONS:
+        consecutive_failures += 1
+        failures_file.write_text(str(consecutive_failures))
+        agent_restarts_file.write_text(str(agent_restarts + 1))
+        log.warn(
+            f"[{now}] agent: {decision} (root_cause={verdict.root_cause}, "
+            f"failure {consecutive_failures}/{max_retries}, "
+            f"agent_restart {agent_restarts + 1}/{agent_cfg.max_agent_restarts})"
+        )
+        if decision == "soft_restart":
+            with_lock(do_soft_restart, sess, logs_dir, cfg)
+        elif decision == "outbid_restart":
+            with_lock(do_auto_restart, sess, logs_dir)
+        elif decision == "hard_restart":
+            _destroy_old_instance(sess)
+            with_lock(do_auto_restart, sess, logs_dir)
+        elif decision == "destroy_restart":
+            with_lock(do_destroy_and_restart, sess, session_id, logs_dir)
+        return decision
+
+    if decision == "idle_stop":
+        do_idle_stop(sess, session_id, logs_dir)
+        return "idle_stop"
+
+    if decision == "give_up":
+        log.error(f"[{now}] agent: give_up ({verdict.root_cause}) -- stopping")
+        do_idle_stop(sess, session_id, logs_dir)
+        return "give_up"
+
+    if decision == "escalate":
+        do_escalate(sess, session_id, logs_dir, verdict, cfg)
+        return "escalate"
+
+    # Unknown / defer -- hand back to deterministic logic by doing nothing here.
+    return "none"
+
+
 # ---------------------------------------------------------------------------
 # Single health check (main pulse entry)
 # ---------------------------------------------------------------------------
@@ -710,6 +943,13 @@ def run_check(
     pcfg = pulse_cfg or PulseConfig()
     cfg = _load_session_config(sess)
 
+    # Mirror this check's output (and any restart steps) into the unified per-job
+    # log so it forms one continuous timeline with the original `beam run`.
+    job_log = sess.get("log_file") or str(
+        session.session_path(logs_dir, session_id).with_suffix(".log")
+    )
+    log.attach_job_log(job_log)
+
 
     # Failure tracking
     failures_file = sessions_dir / f".pulse_failures_{session_id}"
@@ -748,7 +988,53 @@ def run_check(
         finally:
             lock_file.unlink(missing_ok=True)
 
-    if instance_status in ("running", "reachable"):
+    # ----- Agent diagnosis (optional) -- runs before the deterministic matrix -----
+    # When pulse.agent.enabled and this state is an agent trigger, route the
+    # decision through the LLM tool-calling loop. On any failure the verdict is
+    # used_agent=False and we fall through to the deterministic matrix below.
+    agent_verdict = None
+    agent_cfg = cfg.pulse.agent
+    trigger = _classify_trigger(instance_status, job_state)
+    if agent_cfg.enabled and auto_restart and trigger and trigger in agent_cfg.trigger_on:
+        _restore_env(sess)  # exposes WANDB_API_KEY / provider creds for the agent's tools
+        observations = _agent_observations(
+            sess, instance_status, job_state, job_info,
+            consecutive_failures=consecutive_failures,
+            idle_strikes=idle_strikes, max_retries=max_retries,
+        )
+        try:
+            from beam.agent.diagnose import diagnose_session
+            agent_verdict = diagnose_session(sess, observations, logs_dir, cfg)
+        except Exception as exc:
+            log.warn(f"[{now}] Agent diagnosis errored ({exc}) -- falling back to deterministic")
+            agent_verdict = None
+    agent_handled = agent_verdict is not None and agent_verdict.used_agent
+
+    if agent_handled:
+        action = _dispatch_agent_decision(
+            agent_verdict, sess, session_id, logs_dir, cfg,
+            consecutive_failures=consecutive_failures,
+            max_retries=max_retries, failures_file=failures_file,
+            with_lock=_with_lock,
+        )
+        # Reflect any counter change written by the dispatcher into the history record.
+        if failures_file.exists():
+            consecutive_failures = int(failures_file.read_text().strip() or 0)
+
+        # Success-gated project-doc update: the pulse call completed and acted
+        # (skip advisory mode, which takes no action). The agent's option to
+        # "create or update" the canonical project knowledge after a good run.
+        if agent_verdict.project_doc_update and not action.startswith("advisory:"):
+            try:
+                from beam.agent.project_doc import update_agent_section
+                repo_root = Path(sess.get("repo_root") or ".")
+                if update_agent_section(repo_root, cfg, agent_verdict.project_doc_update):
+                    agent_verdict.project_doc_updated = True
+                    log.done(f"[{now}] Updated project doc ({cfg.pulse.agent.project_doc}) agent section.")
+            except Exception as exc:
+                log.warn(f"[{now}] Project-doc update failed: {exc}")
+
+    elif instance_status in ("running", "reachable"):
 
         if job_state == "finished":
             # Job completed successfully — reset all counters
@@ -889,7 +1175,7 @@ def run_check(
         log.info(f"[{now}] Transient error ({instance_status}) -- will retry next check")
 
     # Append to pulse history log
-    _append_history(logs_dir, session_id, {
+    entry: dict[str, Any] = {
         "ts": now,
         "instance_status": instance_status,
         "job_state": job_state,
@@ -897,7 +1183,21 @@ def run_check(
         "action": action,
         "consecutive_failures": consecutive_failures,
         "idle_strikes": idle_strikes,
-    })
+    }
+    if agent_verdict is not None:
+        entry.update({
+            "agent_used": agent_verdict.used_agent,
+            "decision": agent_verdict.decision,
+            "root_cause": agent_verdict.root_cause,
+            "reason": agent_verdict.reason,
+            "confidence": agent_verdict.confidence,
+            "tool_calls": [t["tool"] for t in agent_verdict.tool_trace],
+            "tokens": agent_verdict.total_tokens,
+            "agent_error": agent_verdict.error or None,
+            "project_doc_updated": agent_verdict.project_doc_updated,
+        })
+    _append_history(logs_dir, session_id, entry)
+    log.detach_job_log()
 
 
 

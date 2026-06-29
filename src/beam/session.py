@@ -71,6 +71,8 @@ def save_session(
         "tmux_session": tmux_session,
         "repo_root": repo_root,
         "name": name,
+        # Unified per-job log: all `beam run` + `beam pulse` output for this job.
+        "log_file": str(session_path(logs_dir, session_id).with_suffix(".log")),
         "created_at": datetime.now(timezone.utc).isoformat(),
         # -- Launch credentials (flat keys, read by pulse provider/restart calls) --
         "runpod_api_key": creds.get_env_value("RUNPOD_API_KEY") if creds else os.environ.get("RUNPOD_API_KEY", ""),
