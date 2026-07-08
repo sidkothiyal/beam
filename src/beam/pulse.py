@@ -654,28 +654,58 @@ def do_destroy_and_restart(sess: dict[str, Any], session_id: str, logs_dir: Path
 # Idle stop
 # ---------------------------------------------------------------------------
 
+def _teardown_instance(
+    sess: dict[str, Any], session_id: str, logs_dir: Path, *, destroy: bool
+) -> None:
+    """Stop or destroy the instance and remove its cron job.
+
+    When *destroy* is True the instance is permanently removed (no lingering
+    storage cost); otherwise it is stopped and can be started again later.
+    """
+    provider = sess.get("provider", "")
+    pod_id = sess.get("pod_id", "")
+    action = "destroy" if destroy else "stop"
+
+    if pod_id:
+        try:
+            p = None
+            if provider == "runpod":
+                from beam.providers.runpod import RunPodProvider
+                p = RunPodProvider(api_key=sess.get("runpod_api_key"))
+            elif provider in ("vast.ai", "vastai"):
+                from beam.providers.vastai import VastAIProvider
+                p = VastAIProvider(api_key=sess.get("vast_api_key"))
+            else:
+                log.warn(f"Unknown provider '{provider}' — cannot {action} instance {pod_id}")
+
+            if p is not None:
+                if destroy:
+                    p.destroy_instance(pod_id)
+                else:
+                    p.stop_instance(pod_id)
+        except Exception as exc:
+            log.warn(f"{action.capitalize()} failed: {exc}")
+
+    uninstall_cron(session_id, logs_dir=logs_dir)
+
+
 def do_idle_stop(sess: dict[str, Any], session_id: str, logs_dir: Path) -> None:
     """Stop the instance and remove its cron job."""
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     log.warn(f"[{now}] Idle-stop triggered -- stopping machine and removing cron job.")
+    _teardown_instance(sess, session_id, logs_dir, destroy=False)
 
-    provider = sess.get("provider", "")
-    pod_id = sess.get("pod_id", "")
 
-    if pod_id:
-        try:
-            if provider == "runpod":
-                from beam.providers.runpod import RunPodProvider
-                p = RunPodProvider(api_key=sess.get("runpod_api_key"))
-                p.stop_instance(pod_id)
-            elif provider in ("vast.ai", "vastai"):
-                from beam.providers.vastai import VastAIProvider
-                p = VastAIProvider(api_key=sess.get("vast_api_key"))
-                p.stop_instance(pod_id)
-        except Exception as exc:
-            log.warn(f"Stop failed: {exc}")
+def do_destroy_stop(sess: dict[str, Any], session_id: str, logs_dir: Path) -> None:
+    """Destroy the instance and remove its cron job.
 
-    uninstall_cron(session_id, logs_dir=logs_dir)
+    Unlike ``do_idle_stop`` (which leaves the instance stopped/inactive), this
+    permanently tears the instance down so no further compute *or* storage cost
+    accrues. Used by ``beam stop``.
+    """
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    log.warn(f"[{now}] Stop triggered -- destroying machine and removing cron job.")
+    _teardown_instance(sess, session_id, logs_dir, destroy=True)
 
 
 def do_escalate(sess: dict[str, Any], session_id: str, logs_dir: Path, verdict: Any, cfg: BeamConfig) -> None:

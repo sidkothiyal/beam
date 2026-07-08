@@ -8,8 +8,8 @@ from beam import log
 from beam.config import BeamConfig
 
 
-def push_image(cfg: BeamConfig, ghcr_image: str) -> None:
-    """Tag and push the local Docker image to ghcr.io."""
+def push_image(cfg: BeamConfig, ghcr_image: str, local_tag: str = "latest") -> None:
+    """Tag and push the local Docker image (``:local_tag``) to ghcr.io."""
     github_username = cfg.credentials.github_username
     token = cfg.credentials.docker_ghcr_token
 
@@ -36,7 +36,7 @@ def push_image(cfg: BeamConfig, ghcr_image: str) -> None:
 
     log.step(f"Tagging and pushing {ghcr_image} ...")
     subprocess.run(
-        ["docker", "tag", f"{docker_image}:latest", ghcr_image],
+        ["docker", "tag", f"{docker_image}:{local_tag}", ghcr_image],
         check=True,
     )
     subprocess.run(["docker", "push", ghcr_image], check=True)

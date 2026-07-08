@@ -36,7 +36,9 @@ beam init                          # Create beam.yaml in current dir
 beam offers --provider vastai      # List GPU offers
 beam attach <session-id>           # Attach to tmux session
 beam logs <session-id>             # Tail training logs
-beam stop <session-id>             # Stop instance + remove pulse cron
+beam ssh <session-id>              # SSH shell on the instance (or run a command)
+beam scp <session-id> SRC DST      # Copy files to/from the instance ("remote:" prefix)
+beam stop <session-id>             # Destroy instance + remove pulse cron
 beam pulse list                    # List active pulse cron jobs
 beam pulse install <session-id>    # Install pulse cron
 beam pulse uninstall <session-id>  # Remove pulse cron
@@ -255,7 +257,7 @@ The agent is further informed by two project-level inputs:
 
 **What it does:** Reads and writes JSON session files. Each session captures everything needed to reconnect, restart, or monitor a job.
 
-**When to use it:** Read sessions in `beam status`, `beam attach`, `beam stop`, `pulse.py`. Write session after pipeline completes.
+**When to use it:** Read sessions in `beam status`, `beam attach`, `beam ssh`, `beam scp`, `beam stop`, `pulse.py`. Write session after pipeline completes.
 
 ### Usage
 

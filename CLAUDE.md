@@ -15,7 +15,9 @@ beam run --provider vastai python train.py             # deploy
 beam run --ip 1.2.3.4 python train.py                 # existing machine
 beam status                                            # show sessions
 beam attach <id>                                       # attach tmux
-beam stop <id>                                         # stop instance
+beam ssh <id>                                          # shell into instance
+beam scp <id> ./data remote:/workspace/data            # copy to/from instance
+beam stop <id>                                          # destroy instance
 ```
 
 ## Non-Obvious Patterns

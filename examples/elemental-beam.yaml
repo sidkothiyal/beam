@@ -143,6 +143,8 @@ providers:
     fallback_order: [default, a100_pcie]
 
 pulse:
+  interval: 5m            # default cron interval used when `beam run` omits --pulse
+  idle_stop: true         # stop the instance when the GPU goes idle (default for --pulse-idle-stop)
   gpu_idle_threshold: 5
   gpu_idle_max_strikes: 3
   gpu_idle_samples: 5

@@ -21,6 +21,39 @@ from beam.steps import (
 )
 
 
+# Fallback runtime base image per provider when a machine config leaves
+# ``base_image`` empty. Chosen so the base is cached on that provider's hosts,
+# making only our thin apt+venv layers pull. Overridable in beam.yaml.
+DEFAULT_BASE_IMAGES: dict[str, str] = {
+    "runpod": "runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404",
+    "vastai": "nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04",
+}
+
+
+def _provider_slug(provider: str) -> str:
+    """Canonical short slug for a provider (used in docker/ghcr tags)."""
+    if provider == "runpod":
+        return "runpod"
+    if provider in ("vast.ai", "vastai"):
+        return "vastai"
+    return ""
+
+
+def _resolve_machine_config(cfg: BeamConfig, provider: str, pod_config_name: str):
+    """Return the machine config for *provider* named *pod_config_name*,
+    falling back to the first configured entry (or None)."""
+    if provider == "runpod":
+        configs = cfg.providers.runpod.configs
+    elif provider in ("vast.ai", "vastai"):
+        configs = cfg.providers.vastai.configs
+    else:
+        return None
+    for mc in configs:
+        if mc.name == pod_config_name:
+            return mc
+    return configs[0] if configs else None
+
+
 class RunContext:
     """Carries mutable state through the pipeline."""
 
@@ -60,6 +93,29 @@ class RunContext:
         self.ghcr_image: str = ""
         self.use_registry_venv: bool = False
 
+        # Per-provider runtime base image (Dockerfile RUNTIME_BASE_IMAGE) and the
+        # local docker tag for this build. Both keyed off the provider so runpod
+        # and vast builds/images don't clobber one another.
+        slug = _provider_slug(self.provider)
+        self.image_tag = slug or "latest"
+        self.base_image = ""
+        if slug:
+            mc = _resolve_machine_config(cfg, self.provider, self.pod_config_name)
+            self.base_image = (getattr(mc, "base_image", "") or "").strip() if mc else ""
+            if not self.base_image:
+                self.base_image = DEFAULT_BASE_IMAGES.get(slug, "")
+            # Known provider but nothing to build FROM (e.g. a newly added provider
+            # with no base_image in beam.yaml and no DEFAULT_BASE_IMAGES entry). The
+            # build still succeeds via the Dockerfile default, but the pull won't be
+            # provider-optimized -- surface it loudly so it can be configured.
+            if not self.base_image:
+                log.warn(
+                    f"No base_image resolved for provider '{self.provider}'. Falling "
+                    f"back to the Dockerfile default base -- fresh-instance pulls may be "
+                    f"slower. Set providers.{slug}.configs[*].base_image in beam.yaml to a "
+                    f"base cached on this provider's hosts."
+                )
+
         # Derived remote paths
         repo_name = cfg.project.name or repo_root.name
         self.remote_code_dir = f"{cfg.remote.project_dir}/{repo_name}"
@@ -70,12 +126,17 @@ class RunContext:
         self.logs_dir = repo_root / ".beam" / "logs"
         self.logs_dir.mkdir(parents=True, exist_ok=True)
 
-        # Registry image
+        # Registry image. The tag carries a provider suffix so each provider gets
+        # its own base-specific image (e.g. loom-env:latest-runpod), while sharing
+        # the identical venv layer (ghcr dedups it by digest).
         github_user = cfg.credentials.github_username
         if github_user:
+            tag = cfg.registry.ghcr_tag
+            if slug:
+                tag = f"{tag}-{slug}"
             self.ghcr_image = (
                 f"ghcr.io/{github_user}/"
-                f"{cfg.registry.ghcr_image_name}:{cfg.registry.ghcr_tag}"
+                f"{cfg.registry.ghcr_image_name}:{tag}"
             )
         if self.provider and github_user:
             self.use_registry_venv = True
@@ -117,11 +178,13 @@ def run_remote(ctx: RunContext) -> None:
     if ctx.use_registry_venv and ctx.ghcr_image:
         # Provider + registry: build -> push -> ensure machine
         log.banner(1, total_steps, "Build venv locally")
-        ctx.build_result = build_venv_mod.build_venv(cfg, ctx.repo_root)
+        ctx.build_result = build_venv_mod.build_venv(
+            cfg, ctx.repo_root, base_image=ctx.base_image, image_tag=ctx.image_tag
+        )
 
-        if ctx.build_result.deps_changed or os.environ.get("FORCE_PUSH") == "1":
+        if ctx.build_result.built or os.environ.get("FORCE_PUSH") == "1":
             log.banner(2, total_steps, "Push image to ghcr.io")
-            push_image_mod.push_image(cfg, ctx.ghcr_image)
+            push_image_mod.push_image(cfg, ctx.ghcr_image, ctx.build_result.image_tag)
         else:
             log.banner(2, total_steps, "Push image to ghcr.io (skipped, up-to-date)")
             log.done("Image unchanged -- using existing registry image.")
@@ -150,7 +213,9 @@ def run_remote(ctx: RunContext) -> None:
         )
 
         log.banner(2, total_steps, "Build venv locally")
-        ctx.build_result = build_venv_mod.build_venv(cfg, ctx.repo_root)
+        ctx.build_result = build_venv_mod.build_venv(
+            cfg, ctx.repo_root, base_image=ctx.base_image, image_tag=ctx.image_tag
+        )
 
     # Update context from machine result
     ctx.pod_id = machine.pod_id
@@ -256,34 +321,11 @@ def run_remote(ctx: RunContext) -> None:
 
 def _snapshot_machine_config(ctx: RunContext) -> dict | None:
     """Serialize the machine config that was used, for pulse restart."""
-    name = ctx.pod_config_name
-    if ctx.provider == "runpod":
-        for mc in ctx.cfg.providers.runpod.configs:
-            if mc.name == name:
-                return mc.model_dump()
-        if ctx.cfg.providers.runpod.configs:
-            return ctx.cfg.providers.runpod.configs[0].model_dump()
-    elif ctx.provider in ("vast.ai", "vastai"):
-        for mc in ctx.cfg.providers.vastai.configs:
-            if mc.name == name:
-                return mc.model_dump()
-        if ctx.cfg.providers.vastai.configs:
-            return ctx.cfg.providers.vastai.configs[0].model_dump()
-    return None
+    mc = _resolve_machine_config(ctx.cfg, ctx.provider, ctx.pod_config_name)
+    return mc.model_dump() if mc else None
 
 
 def _get_recovery_policy(ctx: RunContext) -> str:
     """Read recovery_policy from the relevant machine config."""
-    if ctx.provider == "runpod":
-        for mc in ctx.cfg.providers.runpod.configs:
-            if mc.name == ctx.pod_config_name:
-                return mc.recovery_policy
-        if ctx.cfg.providers.runpod.configs:
-            return ctx.cfg.providers.runpod.configs[0].recovery_policy
-    elif ctx.provider in ("vast.ai", "vastai"):
-        for mc in ctx.cfg.providers.vastai.configs:
-            if mc.name == ctx.pod_config_name:
-                return mc.recovery_policy
-        if ctx.cfg.providers.vastai.configs:
-            return ctx.cfg.providers.vastai.configs[0].recovery_policy
-    return "restart"
+    mc = _resolve_machine_config(ctx.cfg, ctx.provider, ctx.pod_config_name)
+    return mc.recovery_policy if mc else "restart"

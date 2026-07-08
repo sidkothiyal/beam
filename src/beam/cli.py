@@ -56,8 +56,8 @@ def run(
     name: Optional[str] = typer.Option(None, "--name", "-n", help="Custom session name for easier tracking"),
     remote_project_dir: Optional[str] = typer.Option(None, "--remote-project-dir", help="Remote workspace root"),
     remote_home: Optional[str] = typer.Option(None, "--remote-home", help="Remote home directory"),
-    pulse_interval: Optional[str] = typer.Option(None, "--pulse", help="Pulse cron interval (e.g. 5m, 1h)"),
-    pulse_idle_stop: bool = typer.Option(False, "--pulse-idle-stop", help="Stop when GPU idle"),
+    pulse_interval: Optional[str] = typer.Option(None, "--pulse", help="Pulse cron interval (e.g. 5m, 1h). Defaults to pulse.interval in beam.yaml"),
+    pulse_idle_stop: Optional[bool] = typer.Option(None, "--pulse-idle-stop/--no-pulse-idle-stop", help="Stop when GPU idle. Defaults to pulse.idle_stop in beam.yaml"),
     no_auto_stop_on_complete: bool = typer.Option(False, "--no-auto-stop-on-complete", help="Don't auto-stop when job finishes"),
     config_file: Optional[str] = typer.Option(None, "--config", help="Path to beam.yaml"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
@@ -83,6 +83,10 @@ def run(
     cfg = load_config(config_path=cfg_path, overrides=overrides)
     repo_root = get_project_root(cfg_path)
 
+    # Resolve pulse settings: explicit CLI flags win, else fall back to config.
+    eff_pulse_interval = pulse_interval if pulse_interval is not None else cfg.pulse.interval
+    eff_pulse_idle_stop = pulse_idle_stop if pulse_idle_stop is not None else cfg.pulse.idle_stop
+
     cmd_str = " ".join(command) if command else ""
 
     from beam.pipeline import RunContext, run_local, run_remote as pipeline_remote
@@ -97,8 +101,8 @@ def run(
         ip=ip or "",
         port=port or "",
         command=cmd_str,
-        pulse_interval=pulse_interval or "",
-        pulse_idle_stop=pulse_idle_stop,
+        pulse_interval=eff_pulse_interval or "",
+        pulse_idle_stop=eff_pulse_idle_stop,
         dry_run=dry_run,
     )
 
@@ -128,16 +132,16 @@ def run(
                 tmp_log.unlink(missing_ok=True)
 
         # Install pulse cron if requested
-        if pulse_interval and cmd_str:
+        if eff_pulse_interval and cmd_str:
             from beam import pulse
-            interval_secs = pulse.parse_duration(pulse_interval)
+            interval_secs = pulse.parse_duration(eff_pulse_interval)
             sess_file = ctx.logs_dir / "sessions" / f"{ctx.session_name}.json"
             pulse.install_cron(
                 ctx.session_name,
                 sess_file,
                 interval_secs,
                 auto_restart=True,
-                idle_stop=pulse_idle_stop,
+                idle_stop=eff_pulse_idle_stop,
                 auto_stop_on_complete=not no_auto_stop_on_complete,
                 max_retries=cfg.pulse.max_retries,
                 logs_dir=ctx.logs_dir,
@@ -526,17 +530,10 @@ def attach(
     """SSH into the remote and attach to the tmux session."""
     sess = _load_session_or_exit(session_id, config_file)
     ip = sess.get("ip", "")
-    port = sess.get("port", "22")
     user = sess.get("user", "root")
-    identity = sess.get("identity_file", "")
     tmux_session = sess.get("tmux_session", session_id)
 
-    cmd = ["ssh"]
-    if port and port != "22":
-        cmd += ["-p", port]
-    if identity:
-        cmd += ["-i", identity]
-    cmd += ["-o", "StrictHostKeyChecking=accept-new"]
+    cmd = _ssh_cmd_prefix(sess)
     cmd += [f"{user}@{ip}", "-t", f"tmux attach -t {tmux_session}"]
     os.execvp("ssh", cmd)
 
@@ -557,9 +554,7 @@ def logs(
     """Tail remote logs for a session."""
     sess = _load_session_or_exit(session_id, config_file)
     ip = sess.get("ip", "")
-    port = sess.get("port", "22")
     user = sess.get("user", "root")
-    identity = sess.get("identity_file", "")
     tmux_session = sess.get("tmux_session", session_id)
     remote_logs_dir = sess.get("remote_logs_dir", "")
 
@@ -571,14 +566,93 @@ def logs(
         remote_logs_dir = f"{remote_project_dir}/logs/{repo_name}"
 
     tail_flag = "-f" if follow else "-n 100"
-    cmd = ["ssh"]
-    if port and port != "22":
-        cmd += ["-p", port]
-    if identity:
-        cmd += ["-i", identity]
-    cmd += ["-o", "StrictHostKeyChecking=accept-new"]
+    cmd = _ssh_cmd_prefix(sess)
     cmd += [f"{user}@{ip}", f"tail {tail_flag} {remote_logs_dir}/{tmux_session}.log"]
     os.execvp("ssh", cmd)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# beam ssh
+# ═══════════════════════════════════════════════════════════════════════════
+
+@app.command()
+def ssh(
+    session_id: str = typer.Argument(
+        ..., help="Session ID to connect to",
+        autocompletion=complete.complete_session_id,
+    ),
+    command: Optional[list[str]] = typer.Argument(
+        None, help="Optional command to run on the remote (after --); omit for an interactive shell",
+    ),
+    config_file: Optional[str] = typer.Option(None, "--config"),
+) -> None:
+    """Open an interactive SSH shell on a session's remote (or run a command).
+
+    Examples:
+        beam ssh mysession                    # interactive shell
+        beam ssh mysession -- nvidia-smi      # run a one-off command
+    """
+    sess = _load_session_or_exit(session_id, config_file)
+    ip = sess.get("ip", "")
+    user = sess.get("user", "root")
+    if not ip:
+        log.error(f"Session {session_id} has no remote IP.")
+        raise typer.Exit(1)
+
+    cmd = _ssh_cmd_prefix(sess)
+    cmd += [f"{user}@{ip}"]
+    if command:
+        # -t forces a pseudo-tty so interactive remote programs behave correctly.
+        cmd += ["-t", " ".join(command)]
+    os.execvp("ssh", cmd)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# beam scp
+# ═══════════════════════════════════════════════════════════════════════════
+
+@app.command()
+def scp(
+    session_id: str = typer.Argument(
+        ..., help="Session ID whose remote to copy to/from",
+        autocompletion=complete.complete_session_id,
+    ),
+    source: str = typer.Argument(
+        ..., help="Source path. Prefix with 'remote:' for a path on the instance.",
+    ),
+    dest: str = typer.Argument(
+        ..., help="Destination path. Prefix with 'remote:' for a path on the instance.",
+    ),
+    recursive: bool = typer.Option(True, "--recursive/--no-recursive", "-r", help="Copy directories recursively"),
+    config_file: Optional[str] = typer.Option(None, "--config"),
+) -> None:
+    """Copy files to/from a session's remote.
+
+    Prefix either path with ``remote:`` to refer to the instance. Examples:
+        beam scp mysession ./data remote:/workspace/data     # upload
+        beam scp mysession remote:/workspace/out ./out       # download
+    """
+    sess = _load_session_or_exit(session_id, config_file)
+    ip = sess.get("ip", "")
+    user = sess.get("user", "root")
+    if not ip:
+        log.error(f"Session {session_id} has no remote IP.")
+        raise typer.Exit(1)
+
+    def _translate(path: str) -> str:
+        if path.startswith("remote:"):
+            return f"{user}@{ip}:{path[len('remote:'):]}"
+        return path
+
+    if not source.startswith("remote:") and not dest.startswith("remote:"):
+        log.error("At least one of source/dest must be a 'remote:' path.")
+        raise typer.Exit(1)
+
+    cmd = _ssh_cmd_prefix(sess, port_flag="-P")
+    if recursive:
+        cmd.append("-r")
+    cmd += [_translate(source), _translate(dest)]
+    os.execvp("scp", cmd)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -593,7 +667,12 @@ def stop(
     ),
     config_file: Optional[str] = typer.Option(None, "--config"),
 ) -> None:
-    """Stop the instance and remove pulse cron for a session."""
+    """Destroy the instance and remove pulse cron for a session.
+
+    This permanently tears the instance down (both RunPod and Vast.ai) so no
+    further compute or storage cost accrues — it does not merely leave the
+    instance in a stopped/inactive state.
+    """
     from beam import pulse as pulse_mod
 
     sess = _load_session_or_exit(session_id, config_file)
@@ -601,8 +680,8 @@ def stop(
     repo_root = get_project_root(cfg_path)
     logs_dir = repo_root / ".beam" / "logs"
 
-    pulse_mod.do_idle_stop(sess, session_id, logs_dir)
-    log.done(f"Session {session_id} stopped.")
+    pulse_mod.do_destroy_stop(sess, session_id, logs_dir)
+    log.done(f"Session {session_id} destroyed.")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -875,6 +954,23 @@ def pulse_agent_diagnose(
 # ═══════════════════════════════════════════════════════════════════════════
 # Helpers
 # ═══════════════════════════════════════════════════════════════════════════
+
+def _ssh_cmd_prefix(sess: dict, *, port_flag: str = "-p") -> list[str]:
+    """Build the leading ``ssh``/``scp`` argv shared by attach/logs/ssh/scp.
+
+    *port_flag* is ``-p`` for ssh and ``-P`` for scp (they spell it differently).
+    """
+    exe = "scp" if port_flag == "-P" else "ssh"
+    port = str(sess.get("port", "22"))
+    identity = sess.get("identity_file", "")
+    cmd = [exe]
+    if port and port != "22":
+        cmd += [port_flag, port]
+    if identity:
+        cmd += ["-i", identity]
+    cmd += ["-o", "StrictHostKeyChecking=accept-new"]
+    return cmd
+
 
 def _load_session_or_exit(session_id: str, config_file: str | None) -> dict:
     from beam import session as sess_mod

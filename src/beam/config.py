@@ -111,6 +111,10 @@ class RunPodMachineConfig(BaseModel):
     spot: bool = False
     recovery_policy: str = "restart"
     image: str = "runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404"
+    # Runtime base the registry image is built FROM (Dockerfile RUNTIME_BASE_IMAGE).
+    # Pick a base this provider caches on its hosts so only our thin layers pull.
+    # Empty -> DEFAULT_BASE_IMAGES fallback in the pipeline.
+    base_image: str = ""
     template_id: str = ""
     container_disk_size: int = 30
     volume_size: int = 50
@@ -127,10 +131,13 @@ class RunPodMachineConfig(BaseModel):
 class VastAIMachineConfig(BaseModel):
     name: str = ""
     instance_label: str = ""
+    # Vast GPU model filter. Matched as a whole-token prefix: "RTX PRO 6000"
+    # matches "RTX PRO 6000 S" and "RTX PRO 6000 WS"; "RTX PRO 6000 S" matches
+    # only itself. Empty = any GPU.
     gpu_name: str = ""
     num_gpus: int = 1
     num_gpus_max: int | None = None
-    gpu_ram_min: float | None = None  # minimum per-GPU VRAM in GB
+    gpu_ram_min: float | None = None  # min per-GPU VRAM in GiB (~3% tolerance applied)
     machine_id: int | None = None
     offer_type: str = "bid"
     offer_limit: int = 10
@@ -142,6 +149,9 @@ class VastAIMachineConfig(BaseModel):
     target_state: str = "running"
     recovery_policy: str = "new"
     image: str = ""
+    # Runtime base the registry image is built FROM (Dockerfile RUNTIME_BASE_IMAGE).
+    # Empty -> DEFAULT_BASE_IMAGES fallback in the pipeline.
+    base_image: str = ""
     onstart: str = ""
     env: str = ""
     pick_strategy: str = "best_value"  # how to rank offers: cheapest, best_value, score
@@ -235,6 +245,11 @@ class PulseAgentConfig(BaseModel):
 
 
 class PulseConfig(BaseModel):
+    # Default pulse cron interval (e.g. "5m", "1h"). Empty = no pulse unless
+    # `beam run --pulse ...` is passed. Used as the fallback for `--pulse`.
+    interval: str = ""
+    # Stop the instance when the GPU goes idle. Fallback for `--pulse-idle-stop`.
+    idle_stop: bool = False
     gpu_idle_threshold: int = 5
     gpu_idle_max_strikes: int = 3
     gpu_idle_samples: int = 5

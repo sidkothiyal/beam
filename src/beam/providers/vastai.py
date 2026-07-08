@@ -23,6 +23,20 @@ class OutbidError(ProviderError):
 
 VAST_API_BASE = "https://console.vast.ai/api/v0"
 
+# Vast reports ``gpu_ram`` in MiB. GPUs marketed as "NN GB" frequently report
+# slightly below the clean binary boundary (e.g. H100 SXM 80GB = 81559 MiB =
+# 79.6 GiB), so a strict ``gpu_ram_min * 1024`` threshold silently excludes
+# them and the offer search returns zero. Admit cards within this tolerance of
+# the requested GiB. VRAM tiers (40/48/80/96/141/192 GB) are spaced far wider
+# than this margin, so it never blurs adjacent tiers.
+GPU_RAM_TOLERANCE = 0.97
+
+# Vast applies a small default page size to /bundles/ searches. When expanding a
+# partial ``gpu_name`` (e.g. "RTX PRO 6000") to the concrete labels Vast offers
+# ("RTX PRO 6000 S", "RTX PRO 6000 WS"), request a large page so we observe every
+# available label before prefix-filtering.
+GPU_NAME_DISCOVERY_LIMIT = 1000
+
 
 @dataclass
 class ResolvedOffer:
@@ -323,8 +337,49 @@ class VastAIProvider(ProviderBase):
         return payload
 
     @staticmethod
-    def build_search_body(cfg: VastAIMachineConfig) -> dict:
-        """Build the search-offers body."""
+    def _gpu_name_matches(candidate: str, query: str) -> bool:
+        """Whole-token prefix match of a Vast ``gpu_name`` label against a query.
+
+        A candidate matches when it equals the query exactly, or when the query
+        is a whole-token prefix of it (i.e. the query followed by a space). So
+        "RTX PRO 6000" matches both "RTX PRO 6000 S" and "RTX PRO 6000 WS", while
+        the fully-qualified "RTX PRO 6000 S" matches only itself. The trailing
+        space guard prevents partial-token matches like "RTX 4080" -> "RTX 4080S".
+        """
+        return candidate == query or candidate.startswith(query + " ")
+
+    def _resolve_gpu_names(self, cfg: VastAIMachineConfig) -> list[str] | None:
+        """Expand ``cfg.gpu_name`` to the concrete Vast labels it matches.
+
+        Vast's API has no server-side substring/prefix filter, so we fetch the
+        labels available under the config's *other* constraints and filter them
+        with :meth:`_gpu_name_matches`. Returns ``None`` when no ``gpu_name`` is
+        set (no filter), or the (possibly empty) list of matching labels, which
+        the caller feeds to the search as an ``in`` filter.
+        """
+        if not cfg.gpu_name:
+            return None
+        probe = self.build_search_body(cfg)
+        probe.pop("gpu_name", None)  # discover across all labels, then prefix-filter
+        probe["limit"] = max(cfg.offer_limit, GPU_NAME_DISCOVERY_LIMIT)
+        available = {o.get("gpu_name", "") for o in self.search_offers(probe)}
+        matched = sorted(
+            n for n in available if n and self._gpu_name_matches(n, cfg.gpu_name)
+        )
+        if matched and matched != [cfg.gpu_name]:
+            log.step(f"gpu_name '{cfg.gpu_name}' matched: {', '.join(matched)}")
+        return matched
+
+    @staticmethod
+    def build_search_body(
+        cfg: VastAIMachineConfig, gpu_names: list[str] | None = None
+    ) -> dict:
+        """Build the search-offers body.
+
+        When *gpu_names* is provided (from :meth:`_resolve_gpu_names`), it filters
+        by that resolved label set via ``in``. When it is ``None``, a configured
+        ``cfg.gpu_name`` falls back to an exact ``eq`` match.
+        """
         is_bid = cfg.offer_type == "bid"
         body: dict = {
             "limit": cfg.offer_limit,
@@ -334,7 +389,9 @@ class VastAIProvider(ProviderBase):
             "rented": {"eq": False},
             "order": [["min_bid" if is_bid else "dph_total", "asc"]],
         }
-        if cfg.gpu_name:
+        if gpu_names is not None:
+            body["gpu_name"] = {"in": gpu_names}
+        elif cfg.gpu_name:
             body["gpu_name"] = {"eq": cfg.gpu_name}
         if cfg.num_gpus or cfg.num_gpus_max is not None:
             gpu_filter: dict = {}
@@ -344,7 +401,9 @@ class VastAIProvider(ProviderBase):
                 gpu_filter["lte"] = cfg.num_gpus_max
             body["num_gpus"] = gpu_filter
         if cfg.gpu_ram_min is not None:
-            body["gpu_ram"] = {"gte": cfg.gpu_ram_min * 1024}
+            # See GPU_RAM_TOLERANCE: marketed "80GB" cards report ~79.6 GiB, so
+            # relax the GiB floor slightly rather than dropping the offer.
+            body["gpu_ram"] = {"gte": int(cfg.gpu_ram_min * 1024 * GPU_RAM_TOLERANCE)}
         if cfg.machine_id:
             body["machine_id"] = {"eq": cfg.machine_id}
         if cfg.disk_gb:
@@ -447,7 +506,8 @@ class VastAIProvider(ProviderBase):
         Each offer dict is augmented with ``_computed_bid`` (the bid price the
         bid strategy would produce) so callers can display it.
         """
-        search_body = self.build_search_body(cfg)
+        gpu_names = self._resolve_gpu_names(cfg)
+        search_body = self.build_search_body(cfg, gpu_names=gpu_names)
         offers = self.search_offers(search_body)
         if not offers:
             return []
@@ -478,7 +538,8 @@ class VastAIProvider(ProviderBase):
         The offer selection and bid price are determined by
         ``cfg.bid_strategy``.
         """
-        search_body = self.build_search_body(cfg)
+        gpu_names = self._resolve_gpu_names(cfg)
+        search_body = self.build_search_body(cfg, gpu_names=gpu_names)
 
         reqs = []
         if cfg.gpu_ram_min is not None:

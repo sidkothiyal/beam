@@ -88,7 +88,7 @@ def _stream_venv(
         try:
             # Create a temporary container to access image filesystem
             r = subprocess.run(
-                ["docker", "create", f"{docker_image}:latest", "true"],
+                ["docker", "create", f"{docker_image}:{build.image_tag}", "true"],
                 capture_output=True, text=True, check=True,
             )
             container_id = r.stdout.strip()

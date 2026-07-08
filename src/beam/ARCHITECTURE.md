@@ -30,8 +30,8 @@ def run(
     pod_id: str = typer.Option(None, "--pod-id"),
     pod_config: str = typer.Option(None, "--pod-config"),    # name from beam.yaml
     name: str = typer.Option("", "-n", "--name"),
-    pulse: bool = typer.Option(False, "--pulse"),
-    pulse_idle_stop: bool = typer.Option(False, "--pulse-idle-stop"),
+    pulse: str = typer.Option(None, "--pulse"),                       # cron interval; falls back to pulse.interval
+    pulse_idle_stop: bool = typer.Option(None, "--pulse-idle-stop/--no-pulse-idle-stop"),  # tri-state; None → pulse.idle_stop
     auto_stop_on_complete: bool = typer.Option(True, "--no-auto-stop-on-complete"),
     config: str = typer.Option(None, "--config"),
     verbose: bool = typer.Option(False, "-v"),
@@ -69,8 +69,16 @@ def attach(session_id: str): ...# ssh -t ... tmux attach-session
 def logs(session_id: str, follow: bool = False): ...  # tail remote log
 
 @app.command()
-def stop(session_id: str): ... # provider.stop_instance() + uninstall_pulse()
+def ssh(session_id: str, command: list[str] = None): ...  # exec ssh (interactive shell or one-off command)
+
+@app.command()
+def scp(session_id: str, source: str, dest: str, recursive: bool = True): ...  # exec scp; "remote:" prefix → instance
+
+@app.command()
+def stop(session_id: str): ... # pulse.do_destroy_stop() — provider.destroy_instance() + uninstall_pulse()
 ```
+
+`attach`/`logs`/`ssh`/`scp` share `_ssh_cmd_prefix(sess, port_flag=...)` for the leading argv (`-p`/`-P`, `-i`, StrictHostKeyChecking).
 
 ### Pulse Sub-Commands
 
@@ -238,14 +246,19 @@ class VastAIMachineConfig(BaseModel):
 
 ```python
 class PulseConfig(BaseModel):
-    enabled: bool = False
-    interval_minutes: int = 5
-    idle_stop: bool = False
-    idle_threshold_minutes: int = 15
-    idle_gpu_threshold: int = 10        # % utilization = idle
-    max_restarts: int = 5
+    interval: str = ""                  # default cron interval (e.g. "5m"); fallback for --pulse
+    idle_stop: bool = False             # stop on GPU idle; fallback for --pulse-idle-stop
+    gpu_idle_threshold: int = 5         # % utilization = idle
+    gpu_idle_max_strikes: int = 3
+    gpu_idle_samples: int = 5
+    gpu_idle_sample_interval: int = 2
+    max_retries: int = 5
+    auto_stop_on_complete: bool = True
     agent: PulseAgentConfig             # agent-mode config (see below)
 ```
+
+`beam run` resolves `--pulse`/`--pulse-idle-stop` against these: an explicit CLI
+flag wins, otherwise the config value is used (both flags are tri-state / optional).
 
 ### `AgentLLMConfig` / `PulseAgentConfig`
 
@@ -481,8 +494,12 @@ def do_destroy_and_restart(ctx: PulseContext) -> None:
     # Used after GPU idle strikes
 
 def do_idle_stop(ctx: PulseContext) -> None:
-    # provider.stop_instance() + uninstall_pulse()
-    # Used when job finished
+    # _teardown_instance(destroy=False): provider.stop_instance() + uninstall_pulse()
+    # Used when job finished / GPU idle / escalate teardown
+
+def do_destroy_stop(ctx: PulseContext) -> None:
+    # _teardown_instance(destroy=True): provider.destroy_instance() + uninstall_pulse()
+    # Used by `beam stop` — permanently tears down (no lingering storage cost)
 ```
 
 ### Backoff
@@ -784,4 +801,4 @@ session_id: str = typer.Argument(..., autocompletion=complete.complete_session_i
 provider: str = typer.Option(..., autocompletion=complete.complete_provider)
 pod_config: str = typer.Option(..., autocompletion=complete.complete_pod_config)
 ```
-Applied to: `attach`, `logs`, `stop` (session_id argument); `pulse install/uninstall/check` (--session option); `run`, `offers` (--provider, --pod-config options).
+Applied to: `attach`, `logs`, `ssh`, `scp`, `stop` (session_id argument); `pulse install/uninstall/check` (--session option); `run`, `offers` (--provider, --pod-config options).

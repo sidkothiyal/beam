@@ -63,7 +63,7 @@ beam/
 ## Module → Feature Lookup
 
 ### `cli.py`
-Entry point for all user-facing commands. Defines the Typer app with commands `run`, `status`, `init`, `offers`, `attach`, `logs`, `stop`, and the `pulse` sub-app (`list`, `install`, `uninstall`, `check`). Routes `beam run` to local execution, existing-machine pipeline, or provision+pipeline based on flags.
+Entry point for all user-facing commands. Defines the Typer app with commands `run`, `status`, `init`, `offers`, `attach`, `logs`, `ssh`, `scp`, `stop`, and the `pulse` sub-app (`list`, `install`, `uninstall`, `check`). Routes `beam run` to local execution, existing-machine pipeline, or provision+pipeline based on flags. `beam stop` **destroys** the instance (RunPod + Vast.ai) via `pulse.do_destroy_stop`; `beam ssh`/`beam scp` exec into `ssh`/`scp` against the session's remote (paths prefixed `remote:` map to the instance).
 
 **Edit when:** Adding a new CLI command, changing flag names, modifying execution routing logic.
 

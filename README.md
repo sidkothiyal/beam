@@ -119,7 +119,9 @@ beam status                    # Show all sessions (live job state by default)
 beam status --offline          # Fast offline view, skips SSH
 beam attach <session-id>       # Attach to tmux session
 beam logs <session-id>         # Tail training logs
-beam stop <session-id>         # Stop instance + remove pulse cron
+beam ssh <session-id>          # Open an SSH shell on the instance
+beam scp <session-id> ...      # Copy files to/from the instance
+beam stop <session-id>         # Destroy instance + remove pulse cron
 ```
 
 ---
@@ -140,8 +142,8 @@ Launch a training job (provision → sync → run).
 | `--pod-id` | | Reconnect to existing pod by ID |
 | `--pod-config` | | Machine config name from beam.yaml |
 | `--name` | `-n` | Session name |
-| `--pulse` | | Enable Pulse monitoring |
-| `--pulse-idle-stop` | | Stop instance when GPU is idle |
+| `--pulse` | | Pulse cron interval (e.g. `5m`); defaults to `pulse.interval` in beam.yaml |
+| `--pulse-idle-stop` / `--no-pulse-idle-stop` | | Stop instance when GPU is idle; defaults to `pulse.idle_stop` in beam.yaml |
 | `--no-auto-stop-on-complete` | | Don't stop instance when job finishes |
 | `--config` | | Path to beam.yaml |
 | `--verbose` | `-v` | Verbose output |
@@ -190,9 +192,31 @@ beam logs <session-id>
 beam logs <session-id> --follow
 ```
 
+### `beam ssh`
+
+Open an interactive SSH shell on a session's instance, or run a one-off command.
+
+```bash
+beam ssh <session-id>                 # interactive shell
+beam ssh <session-id> -- nvidia-smi   # run a command
+```
+
+### `beam scp`
+
+Copy files to/from a session's instance. Prefix either path with `remote:` to
+refer to the instance.
+
+```bash
+beam scp <session-id> ./data remote:/workspace/data    # upload
+beam scp <session-id> remote:/workspace/out ./out       # download
+beam scp <session-id> --no-recursive ./f remote:/tmp/f  # single file, no -r
+```
+
 ### `beam stop`
 
-Stop a session's instance and remove its Pulse cron job.
+Destroy a session's instance and remove its Pulse cron job. This permanently
+tears the instance down for both RunPod and Vast.ai (no lingering compute or
+storage cost) — it does not merely leave it in a stopped/inactive state.
 
 ```bash
 beam stop <session-id>
@@ -225,8 +249,14 @@ project:
 ### `registry`
 ```yaml
 registry:
-  image: ghcr.io/user/beam-env  # Docker image for venv (optional)
+  ghcr_image_name: loom-env     # ghcr.io/<user>/<name>
+  ghcr_tag: latest              # base tag; a per-provider suffix is appended
 ```
+In registry mode the pushed image is tagged **per provider** —
+`ghcr.io/<user>/<ghcr_image_name>:<ghcr_tag>-<provider>` (e.g. `loom-env:latest-runpod`,
+`loom-env:latest-vastai`) — so each provider gets an image built `FROM` a base it caches on its
+hosts (see `base_image` below). A provider-less/manual build uses the plain `<ghcr_tag>` tag.
+The identical venv layer is shared across the per-provider images (ghcr dedups it by digest).
 
 ### `remote`
 ```yaml
@@ -253,10 +283,10 @@ credentials:
 ### `providers.vastai.machines[]`
 ```yaml
 - name: rtx4090                  # Config name (use with --pod-config)
-  gpu_name: RTX_4090             # GPU model filter
+  gpu_name: "RTX 4090"           # GPU model filter; whole-token prefix ("RTX PRO 6000" matches "... S"/"... WS")
   num_gpus: 1
   num_gpus_max: 1                # Max GPUs (for multi-GPU offers)
-  gpu_ram_min: 20                # Minimum GPU RAM (GB)
+  gpu_ram_min: 20                # Minimum GPU RAM (GiB; ~3% tolerance so "80GB" cards that report 79.6 GiB match)
   machine_id: null               # Pin to specific machine ID
   offer_type: bid                # "bid" or "on-demand"
   offer_limit: 20                # Max offers to consider
@@ -267,7 +297,10 @@ credentials:
   runtype: ssh                   # "ssh" or "jupyter"
   target_state: running
   recovery_policy: restart       # "restart", "ignore", or "destroy"
-  image: pytorch/pytorch:latest
+  image: pytorch/pytorch:latest  # pod image (fallback / stream-path base)
+  base_image: ""                 # registry-mode: Dockerfile RUNTIME_BASE_IMAGE to build FROM;
+                                 # pick a base cached on this provider's hosts for faster pulls.
+                                 # Empty -> per-provider default (nvidia/cuda for vast).
   onstart: ""                    # Script to run on instance start
   env: {}                        # Environment variables
   pick_strategy: cheapest        # How to pick from offers
@@ -288,7 +321,9 @@ credentials:
   cloud_tier: SECURE             # "SECURE" or "COMMUNITY"
   spot: false
   recovery_policy: restart
-  image: runpod/pytorch:latest
+  image: runpod/pytorch:latest   # pod image (fallback / stream-path base)
+  base_image: ""                 # registry-mode: Dockerfile RUNTIME_BASE_IMAGE to build FROM;
+                                 # empty -> per-provider default (runpod/pytorch for runpod).
   template_id: null
   container_disk_size: 20        # GB
   volume_size: 50                # GB
@@ -436,6 +471,8 @@ Then restart your shell (or `source ~/.zshrc` / `source ~/.bashrc`).
 |---------|-----------|
 | `beam attach <TAB>` | Session IDs |
 | `beam logs <TAB>` | Session IDs |
+| `beam ssh <TAB>` | Session IDs |
+| `beam scp <TAB>` | Session IDs |
 | `beam stop <TAB>` | Session IDs |
 | `beam pulse install --session <TAB>` | Session IDs |
 | `beam pulse uninstall --session <TAB>` | Session IDs |
