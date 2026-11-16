@@ -115,6 +115,8 @@ providers:
         offer_limit: 30
         # pick_strategy: best_value  # default — highest DLPerf/$/hr
         # bid_strategy: multiplier   # default — bid at min_bid * bid_multiplier
+        # avoid_owned_machines: true # default — a repeat `beam run` skips hosts
+        #                            # you already occupy, so it never outbids itself
         bid_multiplier: 1.1      # 10% above host minimum for stability
         price: 0.075             # floor for progressive-bidding fallback ($/hr)
         price_max: 0.250         # absolute cap ($/hr)

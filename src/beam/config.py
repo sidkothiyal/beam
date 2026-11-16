@@ -156,6 +156,10 @@ class VastAIMachineConfig(BaseModel):
     env: str = ""
     pick_strategy: str = "best_value"  # how to rank offers: cheapest, best_value, score
     bid_strategy: str = "multiplier"   # how to price the bid: multiplier, percentile, fixed
+    # Skip offers on machines this account already has a live instance on, so a
+    # repeated `beam run` doesn't bid against (and outbid) itself. Set False to
+    # allow stacking multiple instances on the same physical host.
+    avoid_owned_machines: bool = True
     bid_multiplier: float = 1.1
     bid_percentile: float = 0.5
     reliability_min: float | None = None

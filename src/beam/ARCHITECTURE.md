@@ -236,6 +236,7 @@ class VastAIMachineConfig(BaseModel):
     bid_strategy: str = "multiplier"    # see bid strategies
     bid_multiplier: float = 1.1
     bid_percentile: int = 50
+    avoid_owned_machines: bool = True   # skip hosts you already occupy (no self-outbid)
     reliability_min: float = 0.0
     dph_max: float = 0.0                # 0 = no limit
     dlperf_min: float = 0.0

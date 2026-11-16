@@ -93,6 +93,57 @@ class VastAIProvider(ProviderBase):
             return resp.get("offers", [])
         return resp if isinstance(resp, list) else []
 
+    def list_instances(self) -> list[dict]:
+        """Return all instances (contracts) owned by this API key's account."""
+        code, resp = self._request("GET", "/instances/")
+        if code != 200:
+            raise ProviderError(f"List instances failed (HTTP {code})")
+        if isinstance(resp, dict):
+            return resp.get("instances", []) or []
+        return resp if isinstance(resp, list) else []
+
+    # Instances in these states no longer hold a bid/contract on their host, so
+    # they don't cause self-competition and shouldn't exclude the host's offers.
+    _RELEASED_STATES = frozenset({"exited"})
+
+    def owned_machine_ids(self) -> set[str]:
+        """Return the ``machine_id``s of hosts this account currently occupies.
+
+        Used to keep a fresh ``beam run`` from bidding on a machine where the
+        account already has a live instance — which would outbid itself. Any
+        instance still holding its contract counts; fully released ones
+        (``exited``) do not. Returns an empty set if the API call fails, so a
+        transient error never blocks provisioning.
+        """
+        try:
+            instances = self.list_instances()
+        except ProviderError as exc:
+            log.warn(f"Could not list existing instances ({exc}); "
+                     "self-competition guard skipped.")
+            return set()
+        owned: set[str] = set()
+        for inst in instances:
+            mid = inst.get("machine_id")
+            if mid in (None, ""):
+                continue
+            cur = str(inst.get("cur_state", "")).lower()
+            if cur in self._RELEASED_STATES:
+                continue
+            owned.add(str(mid))
+        return owned
+
+    @staticmethod
+    def _filter_excluded_machines(
+        offers: list[dict], exclude_machine_ids: set[str] | None
+    ) -> list[dict]:
+        """Drop offers hosted on any machine in *exclude_machine_ids*."""
+        if not exclude_machine_ids:
+            return offers
+        return [
+            o for o in offers
+            if str(o.get("machine_id", "")) not in exclude_machine_ids
+        ]
+
     # -- lifecycle -------------------------------------------------------------
 
     def _create_raw(self, offer_id: str | int, payload: dict) -> tuple[int, dict]:
@@ -519,7 +570,7 @@ class VastAIProvider(ProviderBase):
             for o in offers:
                 o["_computed_bid"] = self._compute_bid(o, offers, cfg)
         else:
-            offers.sort(key=lambda o: o.get("dph_total", INF))
+            offers.sort(key=lambda o: o.get("dph_total", float("inf")))
             for o in offers:
                 o["_computed_bid"] = 0.0
 
@@ -532,11 +583,15 @@ class VastAIProvider(ProviderBase):
         cfg: VastAIMachineConfig,
         *,
         exclude_offer_ids: set[str] | None = None,
+        exclude_machine_ids: set[str] | None = None,
     ) -> ResolvedOffer:
         """Search for the best offer matching the config requirements.
 
         The offer selection and bid price are determined by
-        ``cfg.bid_strategy``.
+        ``cfg.bid_strategy``. Offers hosted on any machine in
+        *exclude_machine_ids* are dropped before ranking — this is how a second
+        ``beam run`` avoids bidding on (and outbidding) an instance the account
+        already has on that host.
         """
         gpu_names = self._resolve_gpu_names(cfg)
         search_body = self.build_search_body(cfg, gpu_names=gpu_names)
@@ -562,6 +617,16 @@ class VastAIProvider(ProviderBase):
         offers = self.search_offers(search_body)
         if exclude_offer_ids:
             offers = [o for o in offers if str(o.get("id", "")) not in exclude_offer_ids]
+        if exclude_machine_ids:
+            before = len(offers)
+            offers = self._filter_excluded_machines(offers, exclude_machine_ids)
+            skipped = before - len(offers)
+            if skipped:
+                log.info(
+                    f"Skipping {skipped} offer(s) on {len(exclude_machine_ids)} "
+                    "machine(s) this account already occupies "
+                    "(avoiding self-competition)."
+                )
         if not offers:
             raise ProviderError(
                 f"No offers found matching requirements ({', '.join(reqs)})"

@@ -8,7 +8,6 @@ from typing import Callable
 from beam import log
 from beam.config import (
     BeamConfig,
-    RunPodMachineConfig,
     VastAIMachineConfig,
 )
 from beam.providers.base import ProviderBase, ProviderError
@@ -320,6 +319,11 @@ def _create_one(
         assert isinstance(provider, VastAIProvider)
         mc: VastAIMachineConfig = create_cfg["_machine_cfg"]
         excluded_offers: set[str] = set()
+        # Machines the account already occupies — excluded so a repeated
+        # `beam run` doesn't bid against (and outbid) its own instance.
+        excluded_machines: set[str] = (
+            provider.owned_machine_ids() if mc.avoid_owned_machines else set()
+        )
         # Track (current_bid, outbid_count) per offer
         offer_state: dict[str, tuple[float, int]] = {}
         attempt = 0
@@ -328,7 +332,9 @@ def _create_one(
             # resolve_offer_id raises ProviderError when no offers remain
             try:
                 resolved = provider.resolve_offer_id(
-                    mc, exclude_offer_ids=excluded_offers
+                    mc,
+                    exclude_offer_ids=excluded_offers,
+                    exclude_machine_ids=excluded_machines,
                 )
             except ProviderError:
                 raise ProviderError(

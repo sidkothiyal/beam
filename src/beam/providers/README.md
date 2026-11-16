@@ -87,6 +87,9 @@ The `api_error` status is important — Pulse skips health-check actions on `api
 **Key features:**
 - Spot/bid marketplace — typically cheaper than RunPod
 - 5 bid strategies for cost/performance optimisation
+- Self-competition guard — a repeated `beam run` skips offers on machines the
+  account already occupies, so it never outbids its own instance
+  (`avoid_owned_machines`, default on)
 - Outbid detection with retry (up to 3 attempts, `_MAX_OUTBID_RETRIES`)
 - Progressive bidding on `create_instance()` (increments until accepted)
 - `wait_ready()` polls `actual_status`, extends timeout for loading states

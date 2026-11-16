@@ -227,10 +227,21 @@ def list_compatible_offers(self, cfg: VastAIMachineConfig) -> list[dict]:
     # Annotates each offer with _computed_bid (from _apply_bid_strategy)
     # Returns filtered list (up to offer_limit)
 
-def resolve_offer_id(self, cfg: VastAIMachineConfig) -> ResolvedOffer:
-    # list_compatible_offers() → pick by pick_strategy
+def resolve_offer_id(
+    self, cfg,
+    *, exclude_offer_ids=None, exclude_machine_ids=None,
+) -> ResolvedOffer:
+    # search_offers() → drop exclude_offer_ids / exclude_machine_ids
+    #                 → pick by pick_strategy
     # _apply_bid_strategy(offer, cfg) → bid_price
     # Returns ResolvedOffer
+
+def owned_machine_ids(self) -> set[str]:
+    # GET /instances/ → machine_id of every non-exited instance
+    # Empty set on API error (never blocks provisioning).
+    # ensure_machine passes this as exclude_machine_ids so a repeated
+    # `beam run` won't bid on a host it already occupies (self-outbid).
+    # Gated by cfg.avoid_owned_machines (default True).
 
 def _apply_bid_strategy(
     self,

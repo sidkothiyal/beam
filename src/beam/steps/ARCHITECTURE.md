@@ -186,6 +186,14 @@ for i, (provider, machine_cfg) in enumerate(configs):
         continue  # try next fallback
 ```
 
+**Self-competition guard (Vast.ai bid path):** before the offer loop,
+`_create_one` calls `provider.owned_machine_ids()` (when
+`cfg.avoid_owned_machines`, default on) and passes the result to every
+`resolve_offer_id(..., exclude_machine_ids=...)` call. This drops offers on
+hosts the account already has a live instance on, so a second `beam run` —
+which with `pick_strategy=best_value` would otherwise deterministically pick the
+same offer — lands on a different machine instead of outbidding itself.
+
 **Constants:**
 ```python
 _MAX_OUTBID_RETRIES = 3
